@@ -1,0 +1,33 @@
+# Document Processing & Parsing
+PyMuPDF
+pypdf
+paddleocr
+docling
+
+# Computer Vision & Image Processing
+opencv-python
+numpy
+python-dotenv
+fastapi
+uvicorn
+python-multipart
+
+# Embeddings & Machine Learning Models
+FlagEmbedding
+torch
+
+# Database & Drivers
+psycopg[binary]
+
+# LLM & Orchestration
+ollama
+
+# Security & Guardrails
+better-profanity
+
+# Agent & Text-to-SQL
+langchain
+langchain-community
+langchain-postgres
+langgraph
+sqlalchemy

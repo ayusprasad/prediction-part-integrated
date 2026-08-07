@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python environments and caches
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# JavaScript dependencies and generated output
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+dist/
+**/dist/
+.vinext/
+**/.vinext/
+.wrangler/
+**/.wrangler/
+
+# Local app data, uploads, logs, and generated artifacts
+Sujit/data/
+**/*.sqlite3
+*.log
+**/*.log
+*.tmp
+
+# Preserved nested repository metadata
+**/.git-frontend-backup/
