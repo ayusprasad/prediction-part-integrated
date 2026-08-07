@@ -25,20 +25,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
-MONTH_NAMES = {
-    "january": 1, "february": 2, "march": 3, "april": 4,
-    "may": 5, "june": 6, "july": 7, "august": 8,
-    "september": 9, "october": 10, "november": 11, "december": 12,
-}
-
-BILL_CHARGE_CATEGORIES = {
-    2: "rent",
-    4: "additional_rent",
-    15: "rent",
-}
-
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[3] / "new predictionm" / "frontend" / "public" / "billing_xgb_model.json"
 DEFAULT_MANIFEST_PATH = Path(__file__).resolve().parents[3] / "new predictionm" / "frontend" / "public" / "billing_model_manifest.json"
+DEFAULT_RULES_PATH = Path(__file__).resolve().parents[2] / "config" / "billing_rules.json"
 
 
 def _number(value: Any) -> Optional[float]:
@@ -84,8 +73,8 @@ def _clean_customer(value: Any) -> Optional[str]:
 class BillingPredictionRequest:
     customer_id: str = ""
     target_year: int = 0
-    target_month: int = 12
-    bill_type: str = "rent"
+    target_month: int = 0
+    bill_type: str = ""
     current_year: Optional[int] = None
     current_month: Optional[int] = None
     structure_type: Optional[str] = None
@@ -129,15 +118,14 @@ class BillingPredictionResult:
 
     def summary(self) -> str:
         request = self.request
+        display_bill_type = str(self.metadata.get("bill_type_label") or request.bill_type.replace("_", " "))
         lines = [
-            f"Predicted {request.bill_type.replace('_', ' ')} for customer {request.customer_id} "
+            f"Predicted {display_bill_type} for customer {request.customer_id or 'manual input'} "
             f"in {request.target_year}-{request.target_month:02d}: INR {self.final_amount:,.2f}",
             "",
             "Calculation breakdown:",
         ]
         lines.extend(f"{idx}. {step}" for idx, step in enumerate(self.calculation_steps, start=1))
-        if self.fallback_applied:
-            lines.extend(["", "Data-quality notes:", *[f"- {reason}" for reason in self.fallback_reasons]])
         return "\n".join(lines)
 
 
@@ -182,12 +170,17 @@ class XgbJsonModel:
 
 class BillingPredictionService:
     def __init__(self):
+        self.rules_path = Path(os.getenv("BILLING_RULES_PATH", str(DEFAULT_RULES_PATH)))
+        self.rules = self._read_rules(self.rules_path)
         self.host = os.getenv("POSTGRES_HOST", "localhost")
         self.port = int(os.getenv("POSTGRES_PORT", "5432"))
         self.dbname = os.getenv("POSTGRES_DB", "postgres")
         self.user = os.getenv("POSTGRES_USER", "postgres")
         self.password = os.getenv("POSTGRES_PASSWORD", "")
         self.schema = os.getenv("POSTGRES_SCHEMA", "rag")
+        configured_limit = os.getenv("BILLING_MAX_FORECAST_MONTHS")
+        configured_rule_limit = self.rules.get("max_forecast_months")
+        self.max_forecast_months = int(configured_limit) if configured_limit else (int(configured_rule_limit) if configured_rule_limit is not None else None)
         self.model_path = Path(os.getenv("BILLING_MODEL_PATH", str(DEFAULT_MODEL_PATH)))
         self.manifest_path = Path(os.getenv("BILLING_MODEL_MANIFEST_PATH", str(DEFAULT_MANIFEST_PATH)))
         self.model: Optional[XgbJsonModel] = None
@@ -197,6 +190,73 @@ class BillingPredictionService:
             raise FileNotFoundError(f"Billing model artifact not found: {self.model_path}")
         if not self.manifest_path.exists():
             raise FileNotFoundError(f"Billing model manifest not found: {self.manifest_path}")
+
+    @staticmethod
+    def _read_rules(path: Path) -> dict[str, Any]:
+        if not path.exists():
+            raise FileNotFoundError(f"Billing rules file not found: {path}")
+        rules = json.loads(path.read_text(encoding="utf-8"))
+        required_sections = ("defaults", "months", "categories", "frequencies", "structures", "formula", "rates", "formula_schedules")
+        missing = [section for section in required_sections if section not in rules]
+        if missing:
+            raise ValueError(f"Billing rules file is missing sections: {', '.join(missing)}.")
+        return rules
+
+    def rules_payload(self) -> dict[str, Any]:
+        """Return only the configuration needed to render the billing form."""
+        return {
+            "version": self.rules.get("version"),
+            "defaults": self.rules["defaults"],
+            "max_forecast_months": self.max_forecast_months,
+            "months": self.rules["months"],
+            "categories": [
+                {key: category[key] for key in ("value", "label")}
+                for category in self.rules["categories"]
+            ],
+            "frequencies": [
+                {key: frequency[key] for key in ("value", "label")}
+                for frequency in self.rules["frequencies"]
+            ],
+            "structures": [
+                {key: structure[key] for key in ("value", "label", "factor")}
+                for structure in self.rules["structures"]
+            ],
+            "rates": [
+                {key: rate[key] for key in ("key", "label")}
+                for rate in self.rules["rates"]
+            ],
+        }
+
+    def _apply_request_defaults(self, request: BillingPredictionRequest) -> None:
+        defaults = self.rules["defaults"]
+        if not request.target_month:
+            request.target_month = int(defaults["target_month"])
+        if not request.bill_type:
+            request.bill_type = str(defaults["category"])
+        if request.water_tax_included is None:
+            request.water_tax_included = bool(defaults["water_tax_included"])
+
+    def _category_label(self, value: str) -> str:
+        return next(
+            (str(category["label"]) for category in self.rules["categories"]
+             if value in {category["value"], category.get("model_value")}),
+            value.replace("_", " "),
+        )
+
+    def _forecast_quality(self, model: XgbJsonModel, current_period: tuple[int, int], target_period: tuple[int, int]) -> dict[str, Any]:
+        horizon = _period_index(*target_period) - _period_index(*current_period)
+        cutoff = model.metrics.get("validation_cutoff")
+        cutoff_match = re.fullmatch(r"(20\d{2})-(\d{2})", str(cutoff or ""))
+        cutoff_period = (int(cutoff_match.group(1)), int(cutoff_match.group(2))) if cutoff_match else None
+        beyond_cutoff = cutoff_period is not None and _period_index(*target_period) > _period_index(*cutoff_period)
+        is_long_horizon = horizon > int(self.rules.get("long_horizon_threshold_months", 0))
+        return {
+            "status": "extrapolation" if beyond_cutoff or is_long_horizon else "within_validation_range",
+            "forecast_horizon_months": horizon,
+            "validation_cutoff": cutoff,
+            "beyond_validation_cutoff": beyond_cutoff,
+            "long_horizon": is_long_horizon,
+        }
 
     @property
     def model_loaded(self) -> bool:
@@ -218,12 +278,11 @@ class BillingPredictionService:
         )
 
     def predict(self, request: BillingPredictionRequest) -> BillingPredictionResult:
+        self._apply_request_defaults(request)
         self._validate(request)
         model = self._get_model()
         fallback_reasons: list[str] = []
-        bill_type = request.bill_type if request.bill_type in {"rent", "additional_rent"} else "rent"
-        if request.bill_type not in {"rent", "additional_rent"}:
-            fallback_reasons.append("The trained model supports rent and additional rent; the request was normalized to rent.")
+        bill_type = self._model_bill_type(request.bill_type)
 
         with self._connect() as conn:
             history = self._load_history(conn, request.customer_id, bill_type)
@@ -238,6 +297,8 @@ class BillingPredictionService:
         current_month = request.current_month or latest_period[1]
         if _period_index(request.target_year, request.target_month) <= _period_index(current_year, current_month):
             raise ValueError("The target period must be after the latest available billing period.")
+        self._validate_horizon(current_year, current_month, request.target_year, request.target_month)
+        forecast_quality = self._forecast_quality(model, (current_year, current_month), (request.target_year, request.target_month))
 
         area = profile.get("area")
         if area is None:
@@ -280,6 +341,7 @@ class BillingPredictionService:
         rates, rate_reasons = self._normalize_rates(rates)
         fallback_reasons.extend(rate_reasons)
         formula = self._apply_formula_layer(
+            rules=self.rules,
             monthly_base=monthly_base,
             rates=rates,
             target_month=request.target_month,
@@ -314,6 +376,8 @@ class BillingPredictionService:
                 "billing_frequency": frequency,
                 "profile": profile,
                 "rates": rates,
+                "bill_type_label": self._category_label(request.bill_type),
+                "forecast_quality": forecast_quality,
             },
         )
         self.contexts[result.context_id] = result
@@ -325,13 +389,26 @@ class BillingPredictionService:
             raise ValueError("Please include a customer ID, for example: customer 1528.")
         year_match = re.search(r"\b(20\d{2})\b", prompt or "")
         target_year = int(year_match.group(1)) if year_match else date.today().year + 1
-        target_month = 12
+        target_month = int(self.rules["defaults"]["target_month"])
         lowered = (prompt or "").lower()
-        for name, month in MONTH_NAMES.items():
+        month_names = {str(item["label"]).lower(): int(item["value"]) for item in self.rules["months"]}
+        for name, month in month_names.items():
             if re.search(rf"\b{name}\b", lowered):
                 target_month = month
                 break
-        bill_type = "additional_rent" if "additional rent" in lowered else "rent"
+        if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in self.rules.get("excluded_prompt_terms", [])):
+            raise ValueError(self.rules.get("excluded_prompt_message", ""))
+        categories = self.rules["categories"]
+        ordered_categories = sorted(
+            categories,
+            key=lambda category: max((len(str(alias)) for alias in category.get("prompt_aliases", [])), default=0),
+            reverse=True,
+        )
+        bill_type = next(
+            (category["value"] for category in ordered_categories
+             if any(alias in lowered for alias in category.get("prompt_aliases", []))),
+            self.rules["defaults"]["category"],
+        )
         return self.predict(BillingPredictionRequest(
             customer_id=customer_match.group(1),
             target_year=target_year,
@@ -341,6 +418,7 @@ class BillingPredictionService:
 
     def predict_from_inputs(self, request: BillingPredictionRequest) -> BillingPredictionResult:
         """Run the complete prediction-interface form without requiring a customer lookup."""
+        self._apply_request_defaults(request)
         model = self._get_model()
         required = {
             "present_year": request.present_year,
@@ -354,28 +432,31 @@ class BillingPredictionService:
         missing = [name for name, value in required.items() if value is None]
         if missing:
             raise ValueError(f"Complete the billing form. Missing: {', '.join(missing)}.")
-        if request.bill_type not in {"rent", "additional_rent"}:
-            raise ValueError("The exported XGBoost model is trained for Rent and Additional rent only. Select one of those bill types.")
-        if not 1 <= int(request.present_month) <= 12 or not 1 <= request.target_month <= 12:
+        self._model_bill_type(request.bill_type)
+        valid_months = {int(item["value"]) for item in self.rules["months"]}
+        if int(request.present_month) not in valid_months or request.target_month not in valid_months:
             raise ValueError("Present and target months must be between 1 and 12.")
         if _period_index(request.target_year, request.target_month) <= _period_index(request.present_year, request.present_month):
             raise ValueError("Target month must be after the present bill month.")
+        self._validate_horizon(request.present_year, request.present_month, request.target_year, request.target_month)
+        forecast_quality = self._forecast_quality(model, (request.present_year, request.present_month), (request.target_year, request.target_month))
 
         amount = max(0.0, float(request.present_amount))
         cgst = max(0.0, float(request.present_cgst))
         sgst = max(0.0, float(request.present_sgst))
         area = max(0.0, float(request.area))
-        frequency = self._normalize_frequency(request.billing_frequency) or "monthly"
+        frequency = self._normalize_frequency(request.billing_frequency) or self.rules["defaults"]["frequency"]
         current_period = (int(request.present_year), int(request.present_month))
         target_period = (request.target_year, request.target_month)
         cgst_rate = cgst / amount if amount else 0.0
         sgst_rate = sgst / amount if amount else 0.0
         path: list[dict[str, Any]] = []
+        model_bill_type = self._model_bill_type(request.bill_type)
         while _period_index(*current_period) < _period_index(*target_period):
             next_period = _month_after(*current_period)
             values = self._feature_values(
                 model=model, amount=amount, cgst=cgst, sgst=sgst, area=area,
-                frequency=frequency, bill_type=request.bill_type,
+                frequency=frequency, bill_type=model_bill_type,
                 current_period=current_period, target_period=next_period,
             )
             raw = model.predict_log(values)
@@ -388,6 +469,7 @@ class BillingPredictionService:
         raw_rates = request.rates or {}
         rates, rate_reasons = self._normalize_rates(raw_rates)
         formula = self._apply_formula_layer(
+            rules=self.rules,
             monthly_base=amount,
             rates=rates,
             target_month=request.target_month,
@@ -415,7 +497,7 @@ class BillingPredictionService:
             data_source="complete billing form + exported XGBoost model artifact",
             fallback_applied=bool(rate_reasons),
             fallback_reasons=rate_reasons,
-            metadata={"history_points": 1, "forecast_path": path, "billing_frequency": frequency, "rates": rates, "manual_inputs": True},
+            metadata={"history_points": 1, "forecast_path": path, "billing_frequency": frequency, "rates": rates, "manual_inputs": True, "bill_type_label": self._category_label(request.bill_type), "forecast_quality": forecast_quality},
         )
         self.contexts[result.context_id] = result
         return result
@@ -427,7 +509,8 @@ class BillingPredictionService:
         year_match = re.search(r"\b(20\d{2})\b", prompt or "")
         month = previous.request.target_month
         lowered = (prompt or "").lower()
-        for name, month_value in MONTH_NAMES.items():
+        month_names = {str(item["label"]).lower(): int(item["value"]) for item in self.rules["months"]}
+        for name, month_value in month_names.items():
             if re.search(rf"\b{name}\b", lowered):
                 month = month_value
                 break
@@ -444,7 +527,13 @@ class BillingPredictionService:
         return self.predict(request)
 
     def _load_history(self, conn, customer_id: str, bill_type: str) -> list[dict[str, Any]]:
-        charge_ids = [2, 15] if bill_type == "rent" else [4]
+        category = next(
+            (item for item in self.rules["categories"] if item.get("model_value") == bill_type),
+            None,
+        )
+        if category is None:
+            raise ValueError(f"No billing rule is configured for model category '{bill_type}'.")
+        charge_ids = category["charge_ids"]
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
@@ -506,9 +595,13 @@ class BillingPredictionService:
 
     def _load_rates(self, conn, year: int, month: int) -> dict[str, Any]:
         target = date(year, month, 1)
+        database_rates = [rate for rate in self.rules["rates"] if rate.get("database_column")]
+        columns = [str(rate["database_column"]) for rate in database_rates]
+        if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column) for column in columns):
+            raise ValueError("Billing rules contain an invalid database column name.")
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT gen_tax, wtr_tax, sewr_tax, wbt, sbt, egc
+            cur.execute(f"""
+                SELECT {', '.join(columns)}
                 FROM public.m_tax_rates
                 WHERE tax_period_from <= %s
                   AND (tax_period_to IS NULL OR tax_period_to >= %s)
@@ -526,22 +619,19 @@ class BillingPredictionService:
             schedule_rows = cur.fetchall()
         rates: dict[str, Any] = {}
         if row:
-            rates.update({"general": row[0], "water": row[1], "sewerage": row[2], "wbt": row[3], "sbt": row[4], "egcess": row[5]})
+            rates.update({rate["key"]: row[index] for index, rate in enumerate(database_rates)})
         for name, value in schedule_rows:
-            if "street" in name:
-                rates["street"] = value
-            elif "tree" in name:
-                rates["tree_cess"] = value
-            elif "education" in name:
-                rates["mecess"] = value
+            for rate in self.rules["rates"]:
+                term = rate.get("schedule_term")
+                if term and term in name:
+                    rates[rate["key"]] = value
         return rates
 
-    @staticmethod
-    def _normalize_rates(raw: dict[str, Any]) -> tuple[dict[str, float], list[str]]:
-        required = ["general", "water", "sewerage", "wbt", "sbt", "egcess", "street", "tree_cess", "mecess"]
+    def _normalize_rates(self, raw: dict[str, Any]) -> tuple[dict[str, float], list[str]]:
         rates: dict[str, float] = {}
         reasons: list[str] = []
-        for name in required:
+        for rate_definition in self.rules["rates"]:
+            name = rate_definition["key"]
             parsed = _rate(raw.get(name))
             if parsed is None:
                 reasons.append(f"No database rate was found for {name}; that tax component was treated as zero.")
@@ -549,29 +639,38 @@ class BillingPredictionService:
             rates[name] = parsed
         return rates, reasons
 
-    @staticmethod
-    def _normalize_frequency(value: Any) -> Optional[str]:
+    def _normalize_frequency(self, value: Any) -> Optional[str]:
         if value is None:
             return None
         text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
-        if text in {"monthly", "month", "1"}:
-            return "monthly"
-        if text in {"yearly", "annual", "annually", "12"}:
-            return "yearly"
-        if text in {"half_yearly", "semi_annual", "semiannual", "6"}:
-            return "half_yearly"
+        for frequency in self.rules["frequencies"]:
+            aliases = [str(alias).lower().replace("-", "_").replace(" ", "_") for alias in frequency.get("aliases", [])]
+            if text == frequency["value"] or text in aliases:
+                return frequency["value"]
         return None
 
-    @staticmethod
-    def _infer_frequency(history: list[dict[str, Any]]) -> str:
+    def _model_bill_type(self, value: str) -> str:
+        for category in self.rules["categories"]:
+            if value in {category["value"], category.get("model_value")}:
+                return str(category["model_value"])
+        labels = ", ".join(str(category["label"]) for category in self.rules["categories"])
+        raise ValueError(f"The billing model supports only: {labels}.")
+
+    def _validate_horizon(self, current_year: int, current_month: int, target_year: int, target_month: int) -> None:
+        horizon = _period_index(target_year, target_month) - _period_index(current_year, current_month)
+        if self.max_forecast_months is not None and horizon > self.max_forecast_months:
+            raise ValueError(f"The target is {horizon} months away. The billing model is limited to {self.max_forecast_months} forecast months; choose a nearer target period.")
+
+    def _infer_frequency(self, history: list[dict[str, Any]]) -> str:
         if len(history) < 2:
-            return "monthly"
+            return str(self.rules["defaults"]["frequency"])
         gaps = [
             _period_index(*history[idx]["period"]) - _period_index(*history[idx - 1]["period"])
             for idx in range(1, len(history))
         ]
         median = sorted(gaps)[len(gaps) // 2]
-        return "yearly" if median >= 12 else "half_yearly" if median >= 6 else "monthly"
+        ordered = sorted(self.rules["frequencies"], key=lambda item: int(item.get("minimum_gap", 0)), reverse=True)
+        return next((item["value"] for item in ordered if median >= int(item.get("minimum_gap", 0))), self.rules["defaults"]["frequency"])
 
     @staticmethod
     def _feature_values(*, model: XgbJsonModel, amount: float, cgst: float, sgst: float, area: float,
@@ -596,41 +695,57 @@ class BillingPredictionService:
         return {column: values.get(column, 0.0) for column in model.feature_columns}
 
     @staticmethod
-    def _apply_formula_layer(*, monthly_base: float, rates: dict[str, float], target_month: int,
+    def _apply_formula_layer(*, rules: dict[str, Any], monthly_base: float, rates: dict[str, float], target_month: int,
                              structure_type: Optional[str], water_tax_included: bool,
                              billing_charge: float = 0.0, present_amount: float = 0.0,
                              present_cgst: float = 0.0, present_sgst: float = 0.0) -> dict[str, Any]:
         structure_text = str(structure_type or "").lower()
-        factor = 0.837 if "mbpt" in structure_text or "port trust" in structure_text else 0.792
-        annual_amount = monthly_base * 12
-        letting_value = annual_amount + annual_amount / 3
-        grvp = letting_value - ((letting_value * 0.9) * 0.9)
-        nrvp = grvp - grvp / 10
+        structure = next((item for item in rules["structures"] if item["value"] == structure_type), None)
+        if structure is None:
+            structure = next((item for item in rules["structures"] if any(term in structure_text for term in item.get("match_terms", []))), None)
+        if structure is None:
+            structure = next(item for item in rules["structures"] if item["value"] == rules["defaults"]["structure"])
+        factor = float(structure["factor"])
+        formula_rules = rules["formula"]
+        months_per_year = float(formula_rules["months_per_year"])
+        letting_value_divisor = float(formula_rules["letting_value_divisor"])
+        deduction_rate = float(formula_rules["deduction_rate"])
+        nrv_divisor = float(formula_rules["nrv_divisor"])
+        half_year_divisor = float(formula_rules["half_year_divisor"])
+        tax_split_divisor = float(formula_rules["tax_split_divisor"])
+        annual_amount = monthly_base * months_per_year
+        letting_value = annual_amount + annual_amount / letting_value_divisor
+        grvp = letting_value - ((letting_value * deduction_rate) * deduction_rate)
+        nrvp = grvp - grvp / nrv_divisor
         grvs = grvp - annual_amount
-        nrvs = grvs - grvs / 10
-        half_annual = annual_amount / 2
+        nrvs = grvs - grvs / nrv_divisor
+        half_annual = annual_amount / half_year_divisor
 
         def dual(rate: float) -> float:
-            return (half_annual * factor * rate) + (nrvs / 2 * rate)
+            return (half_annual * factor * rate) + (nrvs / tax_split_divisor * rate)
 
         tax_items: list[dict[str, Any]] = []
-        if target_month in {4, 10}:
-            schedule = "Pre taxes · April / October"
-            tax_items.extend([
-                {"label": "Property tax", "value": (nrvs * rates["general"] / 2) + (nrvp * rates["sewerage"] / 2) + ((nrvp * rates["water"] / 2) if water_tax_included else 0.0)},
-                {"label": "Water benefit tax", "value": dual(rates["wbt"])},
-                {"label": "Sewerage benefit tax", "value": dual(rates["sbt"])},
-                {"label": "Employee guarantee cess", "value": dual(rates["egcess"])},
-                {"label": "Street tax", "value": nrvp * rates["street"] / 2},
-            ])
-        elif target_month in {3, 9}:
-            schedule = "Post taxes · March / September"
-            tax_items.extend([
-                {"label": "Maharashtra education cess", "value": dual(rates["mecess"])},
-                {"label": "Tree cess", "value": dual(rates["tree_cess"])},
-            ])
+        if target_month in {item for schedule_item in rules["formula_schedules"] for item in schedule_item.get("months", [])}:
+            selected_schedule = next(item for item in rules["formula_schedules"] if target_month in item.get("months", []))
+            schedule = selected_schedule["label"]
+            for item in selected_schedule.get("items", []):
+                kind = item.get("kind")
+                if kind == "property_tax":
+                    property_keys = item.get("rate_keys", [])
+                    value = (nrvs * rates.get(property_keys[0], 0.0) / tax_split_divisor) if property_keys else 0.0
+                    if len(property_keys) > 1:
+                        value += nrvp * rates.get(property_keys[1], 0.0) / tax_split_divisor
+                    if water_tax_included and len(property_keys) > 2:
+                        value += nrvp * rates.get(property_keys[2], 0.0) / tax_split_divisor
+                elif kind == "dual":
+                    value = dual(rates.get(item.get("rate_key"), 0.0))
+                elif kind == "street":
+                    value = nrvp * rates.get(item.get("rate_key"), 0.0) / tax_split_divisor
+                else:
+                    continue
+                tax_items.append({"label": item["label"], "value": value})
         else:
-            schedule = "No scheduled formula tax"
+            schedule = rules.get("unscheduled_formula_label", "")
 
         area_charge = max(0.0, billing_charge)
         taxable_base = monthly_base + area_charge
@@ -641,7 +756,7 @@ class BillingPredictionService:
         total_tax = sum(item["value"] for item in tax_items)
         final_amount = taxable_base + predicted_cgst + predicted_sgst + total_tax
         steps = [
-            f"Forecast base amount = INR {monthly_base:,.2f} using the exported XGBoost model.",
+            f"Forecast base amount = INR {monthly_base:,.2f}.",
             f"Area-linked billing charge = INR {area_charge:,.2f}.",
             f"Predicted CGST = INR {predicted_cgst:,.2f}; predicted SGST = INR {predicted_sgst:,.2f} using the present bill rates.",
             f"Annual amount (AM) = INR {annual_amount:,.2f}.",
@@ -653,11 +768,11 @@ class BillingPredictionService:
         ]
         return {"final_amount": final_amount, "formula_schedule": schedule, "tax_items": tax_items, "total_formula_tax": total_tax, "calculation_steps": steps}
 
-    @staticmethod
-    def _validate(request: BillingPredictionRequest) -> None:
+    def _validate(self, request: BillingPredictionRequest) -> None:
         if not _clean_customer(request.customer_id):
             raise ValueError("customer_id is required.")
-        if not 1 <= request.target_month <= 12:
+        valid_months = {int(item["value"]) for item in self.rules["months"]}
+        if request.target_month not in valid_months:
             raise ValueError("target_month must be between 1 and 12.")
         if request.target_year < 2000:
             raise ValueError("target_year must be a valid four-digit year.")

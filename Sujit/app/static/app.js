@@ -6,6 +6,8 @@ let activeSessionId = generateId();
 let activeSessionMessages = [];
 let isSessionSavedInHistory = false;
 let activePredictionContextId = null;
+let billingRules = null;
+let billingRulesPromise = null;
 
 // Updated suggestion chips
 const suggestionItems = [
@@ -92,6 +94,67 @@ let healthPollInterval = null;
 
 let uploadedDocumentsList = [];
 
+function setSelectOptions(id, items, valueKey = "value", labelBuilder = (item) => item.label) {
+  const select = document.getElementById(id);
+  if (!select) return;
+  select.replaceChildren();
+  items.forEach((item) => {
+    const option = document.createElement("option");
+    option.value = String(item[valueKey]);
+    option.textContent = labelBuilder(item);
+    select.appendChild(option);
+  });
+}
+
+async function loadBillingRules() {
+  billingRulesPromise = fetch("/api/billing/rules")
+    .then(async (response) => {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Billing rules are unavailable.");
+      billingRules = data;
+      setSelectOptions("billing-target-month", data.months);
+      setSelectOptions("billing-frequency", data.frequencies);
+      setSelectOptions("billing-type", data.categories);
+      setSelectOptions("billing-line-category", data.categories);
+      setSelectOptions("billing-structure", data.structures, "value", (item) => `${item.label} · ${Number(item.factor).toFixed(3)}`);
+      const targetMonth = document.getElementById("billing-target-month");
+      if (targetMonth) targetMonth.value = String(data.defaults.target_month);
+      const frequency = document.getElementById("billing-frequency");
+      if (frequency) frequency.value = data.defaults.frequency;
+      const category = document.getElementById("billing-type");
+      if (category) category.value = data.defaults.category;
+      const lineCategory = document.getElementById("billing-line-category");
+      if (lineCategory) lineCategory.value = data.defaults.category;
+      const structure = document.getElementById("billing-structure");
+      if (structure) structure.value = data.defaults.structure;
+      const ratesContainer = document.getElementById("billing-rates-container");
+      if (ratesContainer) {
+        ratesContainer.replaceChildren();
+        data.rates.forEach((rate) => {
+          const label = document.createElement("label");
+          label.className = "text-xs text-muted-foreground";
+          label.textContent = rate.label;
+          const input = document.createElement("input");
+          input.id = `billing-rate-${rate.key}`;
+          input.type = "number";
+          input.step = "0.01";
+          input.className = "mt-1 h-9 w-full rounded-lg border border-border px-2 text-sm";
+          label.appendChild(input);
+          ratesContainer.appendChild(label);
+        });
+      }
+    })
+    .catch((error) => {
+      billingRules = null;
+      const resultBox = document.getElementById("billing-result");
+      if (resultBox) {
+        resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800";
+        resultBox.textContent = error.message;
+      }
+    });
+  return billingRulesPromise;
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   initIcons();
   loadStoredState();
@@ -100,6 +163,7 @@ document.addEventListener("DOMContentLoaded", () => {
   renderSuggestions();
   renderMessages();
   loadUploadedDocuments();
+  loadBillingRules();
   setupEventListeners();
 });
 
@@ -522,14 +586,23 @@ function getBubbleTextContent(msg) {
     `;
   }
   const prediction = msg.prediction ? renderPredictionHtml(msg.prediction) : '';
-  return `${escapeHtml(msg.text)}${prediction}${msg.isStreaming ? '<span class="inline-block w-1.5 h-4 bg-navy ml-1 animate-pulse align-middle"></span>' : ''}`;
+  const visibleText = msg.prediction ? stripPredictionNotes(msg.text) : msg.text;
+  return `${escapeHtml(visibleText)}${prediction}${msg.isStreaming ? '<span class="inline-block w-1.5 h-4 bg-navy ml-1 animate-pulse align-middle"></span>' : ''}`;
+}
+
+function stripPredictionNotes(text) {
+  const marker = "\nData-quality notes:";
+  const markerIndex = String(text || "").indexOf(marker);
+  const withoutNotes = markerIndex >= 0 ? String(text).slice(0, markerIndex).trim() : String(text || "");
+  return withoutNotes.replace(/\s+using the exported XGBoost model\./gi, ".");
 }
 
 function renderPredictionHtml(prediction) {
   if (!prediction) return '';
   const rows = (prediction.tax_items || []).map(item => `<div class="flex justify-between gap-3"><span>${escapeHtml(String(item.label))}</span><span class="font-mono">INR ${Number(item.value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div>`).join('');
   const steps = (prediction.calculation_steps || []).map(step => `<li>${escapeHtml(String(step))}</li>`).join('');
-  return `<div class="mt-3 rounded-lg border border-gold/30 bg-white p-3 text-xs"><div class="font-semibold text-navy mb-2">Forecast breakdown</div><div class="space-y-1">${rows || '<div>No scheduled formula tax.</div>'}</div><div class="mt-2 pt-2 border-t border-border font-semibold flex justify-between"><span>Final predicted amount</span><span class="text-gov-green">INR ${Number(prediction.final_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div><details class="mt-2"><summary class="cursor-pointer text-navy font-medium">Calculation steps and data notes</summary><ol class="list-decimal ml-4 mt-1 space-y-1 text-muted-foreground">${steps}</ol>${(prediction.fallback_reasons || []).length ? `<div class="mt-2 text-gold">${prediction.fallback_reasons.map(reason => escapeHtml(String(reason))).join('<br>')}</div>` : ''}</details></div>`;
+  const schedule = escapeHtml(String(prediction.formula_schedule || ""));
+  return `<div class="mt-3 rounded-lg border border-gold/30 bg-white p-3 text-xs"><div class="font-semibold text-navy mb-2">Forecast breakdown</div><div class="space-y-1">${rows || `<div>${schedule}</div>`}</div><div class="mt-2 pt-2 border-t border-border font-semibold flex justify-between"><span>Final predicted amount</span><span class="text-gov-green">INR ${Number(prediction.final_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div><details class="mt-2"><summary class="cursor-pointer text-navy font-medium">Calculation steps</summary><ol class="list-decimal ml-4 mt-1 space-y-1 text-muted-foreground">${steps}</ol></details></div>`;
 }
 
 // Smooth Direct DOM Update for Real-Time Streaming (Zero Blinking!)
@@ -1249,18 +1322,32 @@ function escapeHtml(str) {
 }
 
 async function runBillingForecast() {
+  const resultBox = document.getElementById("billing-result");
+  if (billingRulesPromise) {
+    try {
+      await billingRulesPromise;
+    } catch (error) {
+      resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800";
+      resultBox.textContent = error.message;
+      return;
+    }
+  }
+  if (!billingRules) {
+    resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800";
+    resultBox.textContent = "Billing rules are not loaded yet.";
+    return;
+  }
   const valueOf = (id) => document.getElementById(id)?.value?.trim() || "";
   const optionalNumber = (id) => valueOf(id) === "" ? null : Number(valueOf(id));
   const customerId = valueOf("billing-customer-id");
   const targetYear = optionalNumber("billing-target-year");
   const targetMonth = Number(document.getElementById("billing-target-month").value);
   const billType = document.getElementById("billing-type").value;
-  const resultBox = document.getElementById("billing-result");
-  const rates = {
-    general: optionalNumber("billing-rate-general"), sewerage: optionalNumber("billing-rate-sewerage"), water: optionalNumber("billing-rate-water"),
-    street: optionalNumber("billing-rate-street"), mecess: optionalNumber("billing-rate-mecess"), tree_cess: optionalNumber("billing-rate-tree-cess"),
-    wbt: optionalNumber("billing-rate-wbt"), sbt: optionalNumber("billing-rate-sbt"), egcess: optionalNumber("billing-rate-egcess"),
-  };
+  const rates = {};
+  billingRules.rates.forEach((rate) => {
+    const value = optionalNumber(`billing-rate-${rate.key}`);
+    if (value !== null) rates[rate.key] = value;
+  });
   Object.keys(rates).forEach((key) => { if (rates[key] === null) delete rates[key]; });
   const payload = {
     customer_id: customerId || null,
@@ -1268,7 +1355,7 @@ async function runBillingForecast() {
     present_amount: optionalNumber("billing-present-amount"), present_cgst: optionalNumber("billing-present-cgst"), present_sgst: optionalNumber("billing-present-sgst"),
     billing_charge: optionalNumber("billing-charge"), area: optionalNumber("billing-area"), billing_frequency: valueOf("billing-frequency"),
     target_year: targetYear, target_month: targetMonth, bill_type: billType, line_category: valueOf("billing-line-category"),
-    structure_type: valueOf("billing-structure"), water_tax_included: document.getElementById("billing-water-included").checked, rates,
+    structure_type: valueOf("billing-structure"), rates,
   };
   const requiredFormIds = ["billing-present-year", "billing-present-month", "billing-present-amount", "billing-present-cgst", "billing-present-sgst", "billing-charge", "billing-area", "billing-target-year"];
   if (requiredFormIds.some((id) => valueOf(id) === "")) { resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800"; resultBox.textContent = "Complete all present bill, target year, charge, and area fields before running the prediction."; return; }

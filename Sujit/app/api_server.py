@@ -127,8 +127,8 @@ class ChatRequest(BaseModel):
 class BillingRequest(BaseModel):
     customer_id: Optional[str] = None
     target_year: int = 0
-    target_month: int = 12
-    bill_type: str = "rent"
+    target_month: int = 0
+    bill_type: str = ""
     current_year: Optional[int] = None
     current_month: Optional[int] = None
     structure_type: Optional[str] = None
@@ -179,6 +179,12 @@ def health_check():
 @app.get("/api/billing/status")
 def billing_status():
     return {"ready": billing_predictor is not None, "error": billing_error, "model": str(getattr(billing_predictor, "model_path", "")) if billing_predictor else None}
+
+@app.get("/api/billing/rules")
+def billing_rules():
+    if billing_predictor is None:
+        raise HTTPException(status_code=503, detail=billing_error or "Billing prediction service is still initializing.")
+    return billing_predictor.rules_payload()
 
 @app.post("/api/billing/predict")
 def billing_predict(req: BillingRequest):
