@@ -214,32 +214,68 @@
           </div>
 
           <div class="grid grid-cols-2 gap-3 md:grid-cols-5">
-            <label class="text-xs text-muted-foreground">Customer ID <input id="billing-customer-id" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="Optional with manual inputs" /></label>
-            <label class="text-xs text-muted-foreground">Present year <input id="billing-present-year" type="number" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="YYYY" /></label>
+            <label class="text-xs text-muted-foreground">Tenancy ID / Customer <select id="billing-customer-id" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"></select><span id="billing-prefill-status" class="mt-1 block text-[11px] text-muted-foreground">Select a tenancy to load source-backed billing values.</span></label>
+            <label class="text-xs text-muted-foreground">Present year <input id="billing-present-year" type="number" min="0" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="YYYY" /></label>
             <label class="text-xs text-muted-foreground">Present month <input id="billing-present-month" type="number" min="1" max="12" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="1–12" /></label>
-            <label class="text-xs text-muted-foreground">Target year <input id="billing-target-year" type="number" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="YYYY" /></label>
+            <label class="text-xs text-muted-foreground">Target year <input id="billing-target-year" type="number" min="0" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="YYYY" /></label>
             <label class="text-xs text-muted-foreground">Target month <select id="billing-target-month" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"></select></label>
           </div>
 
           <div class="mt-5 grid grid-cols-2 gap-3 md:grid-cols-4">
-            <label class="text-xs text-muted-foreground">Present amount <input id="billing-present-amount" type="number" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
-            <label class="text-xs text-muted-foreground">Present CGST <input id="billing-present-cgst" type="number" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
-            <label class="text-xs text-muted-foreground">Present SGST <input id="billing-present-sgst" type="number" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
-            <label class="text-xs text-muted-foreground">Billing charge <input id="billing-charge" type="number" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
-            <label class="text-xs text-muted-foreground">Area <input id="billing-area" type="number" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="sq. m" /></label>
+            <label class="text-xs text-muted-foreground">Present amount <input id="billing-present-amount" type="number" min="0" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
+            <label class="text-xs text-muted-foreground">Present CGST <input id="billing-present-cgst" type="number" min="0" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
+            <label class="text-xs text-muted-foreground">Present SGST <input id="billing-present-sgst" type="number" min="0" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="INR" /></label>
+            <label class="text-xs text-muted-foreground">Area <input id="billing-area" type="number" min="0" step="0.01" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm" placeholder="sq. m" /></label>
             <label class="text-xs text-muted-foreground">Billing frequency <select id="billing-frequency" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"></select></label>
             <label class="text-xs text-muted-foreground">Bill type <select id="billing-type" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"></select></label>
-            <label class="text-xs text-muted-foreground">Line category <select id="billing-line-category" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"></select></label>
           </div>
 
           <div class="mt-4 flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             <label>Structure <select id="billing-structure" class="ml-1 h-9 rounded-lg border border-border px-2 text-xs"></select></label>
           </div>
 
-          <details class="mt-5 rounded-xl border border-border bg-secondary/40 p-3" open><summary class="cursor-pointer text-sm font-semibold text-navy">Formula rates (%)</summary><div id="billing-rates-container" class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5"></div></details>
+          <details id="billing-rates-details" class="mt-5 rounded-xl border border-border bg-secondary/40 p-3" open><summary class="cursor-pointer text-sm font-semibold text-navy">Formula rates (%)</summary><div id="billing-rates-container" class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5"></div></details>
 
           <div id="billing-result" class="hidden mt-4 rounded-lg border border-border bg-secondary/60 p-3 text-sm"></div>
           <div class="mt-5 flex justify-end gap-2"><button id="billing-cancel-btn" type="button" class="rounded-lg border border-border px-4 py-2 text-sm text-muted-foreground hover:bg-secondary">Cancel</button><button id="billing-run-btn" type="button" class="rounded-lg bg-navy px-5 py-2 text-sm font-semibold text-white hover:bg-navy-light">Run prediction and add to chat</button></div>
+        </div>
+      </div>
+
+      <div id="tender-panel" class="hidden fixed inset-0 z-40 bg-navy/30 p-4 sm:p-8 backdrop-blur-sm">
+        <div class="mx-auto max-h-[calc(100vh-2rem)] max-w-6xl overflow-y-auto rounded-2xl border border-gold/30 bg-white p-5 shadow-2xl sm:max-h-[calc(100vh-4rem)] sm:p-6">
+          <div class="flex items-start justify-between gap-4 mb-4">
+            <div><p class="text-[10px] font-bold uppercase tracking-widest text-gold">SOURCE-BACKED WORKFLOW</p><h3 class="font-display text-xl font-semibold text-navy">Tender Publication Workflow</h3><p class="mt-1 text-xs text-muted-foreground">Select an eligible vacant plot, complete the LAC evidence and enter only approved commercial inputs. The workflow will not infer missing rates or approvals.</p></div>
+            <button id="tender-close-btn" type="button" class="p-1.5 rounded-md hover:bg-secondary text-muted-foreground" aria-label="Close tender workflow"><i data-lucide="x" class="w-4 h-4"></i></button>
+          </div>
+
+          <div class="grid gap-3 md:grid-cols-3">
+            <label class="text-xs text-muted-foreground">Eligible vacant plot<select id="tender-plot-select" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"><option value="">Select a vacant plot</option></select></label>
+            <label class="text-xs text-muted-foreground">LAC checklist<select id="tender-checklist-select" class="mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm"></select></label>
+            <div class="flex items-end"><button id="tender-reload-btn" type="button" class="h-10 rounded-lg border border-border px-4 text-sm text-navy hover:bg-secondary">Reload source data</button></div>
+          </div>
+          <div id="tender-plot-summary" class="hidden mt-3 rounded-lg border border-border bg-secondary/40 p-3 text-xs text-muted-foreground"></div>
+
+          <section class="mt-5 rounded-xl border border-border p-4">
+            <h4 class="font-display text-base font-semibold text-navy">Proposal and approved financial inputs</h4>
+            <p class="mt-1 text-xs text-muted-foreground">Blank values remain blank until an authorised source provides them.</p>
+            <div id="tender-fields-container" class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"></div>
+          </section>
+
+          <details id="tender-checklist-details" class="mt-4 rounded-xl border border-border bg-secondary/40 p-4" open>
+            <summary class="cursor-pointer text-sm font-semibold text-navy">LAC checklist evidence</summary>
+            <div id="tender-checklist-container" class="mt-3 space-y-3"></div>
+          </details>
+
+          <section class="mt-4 rounded-xl border border-border p-4">
+            <h4 class="font-display text-base font-semibold text-navy">Calculation and workflow stage</h4>
+            <div id="tender-calculation" class="mt-3 text-sm text-muted-foreground">Choose a plot and enter approved calculation inputs to prepare the calculation.</div>
+            <div id="tender-status" class="mt-3 text-sm"></div>
+            <label class="mt-3 block text-xs text-muted-foreground">Return / approval comment<textarea id="tender-comment" rows="2" class="mt-1 w-full rounded-lg border border-border p-2 text-sm" placeholder="Required when returning a stage; recorded in workflow history."></textarea></label>
+            <div id="tender-action-buttons" class="mt-3 flex flex-wrap gap-2"></div>
+            <div id="tender-export-links" class="mt-3 flex flex-wrap gap-2"></div>
+          </section>
+          <div id="tender-result" class="hidden mt-4 rounded-lg border p-3 text-sm"></div>
+          <div class="mt-5 flex justify-end gap-2"><button id="tender-cancel-btn" type="button" class="rounded-lg border border-border px-4 py-2 text-sm text-muted-foreground hover:bg-secondary">Close</button><button id="tender-save-btn" type="button" class="rounded-lg bg-navy px-5 py-2 text-sm font-semibold text-white hover:bg-navy-light">Save LAC draft</button></div>
         </div>
       </div>
 
@@ -280,6 +316,8 @@
           <div class="relative shrink-0">
             <select id="context-select" class="h-11 w-[160px] shrink-0 rounded-lg border border-border bg-background px-3 text-xs font-medium text-foreground focus:border-navy focus:outline-none focus:ring-2 focus:ring-navy/20 cursor-pointer">
               <option value="Board Note">Board Note</option>
+              <option value="__billing_forecast__">Billing Forecast</option>
+              <option value="__tender_publication__">Tender Publication Workflow</option>
               <option value="Breach">Breach</option>
               <option value="Chairman Note">Chairman Note</option>
               <option value="Letter">Letter</option>
@@ -300,9 +338,6 @@
           />
 
           <!-- Send Button -->
-          <button type="button" id="billing-forecast-btn" title="Open database-backed billing forecast" class="h-11 shrink-0 rounded-lg bg-gold px-3 text-xs font-semibold text-white hover:bg-gold-light hover:text-navy transition-colors shadow flex items-center justify-center gap-1.5 focus:ring-2 focus:ring-gold/30">
-            <i data-lucide="calculator" class="h-4 w-4"></i><span class="hidden sm:inline">Billing Forecast</span>
-          </button>
           <button type="submit" id="send-btn" class="h-11 shrink-0 rounded-lg bg-navy px-5 text-sm font-semibold text-white hover:bg-navy-light transition-colors shadow flex items-center justify-center gap-1.5 focus:ring-2 focus:ring-navy/30">
             <i data-lucide="send" class="h-4 w-4"></i> Send
           </button>
@@ -331,6 +366,6 @@
     </div>
   </footer>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=tender-publication-workflow"></script>
 </body>
 </html>

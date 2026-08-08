@@ -8,6 +8,13 @@ let isSessionSavedInHistory = false;
 let activePredictionContextId = null;
 let billingRules = null;
 let billingRulesPromise = null;
+let billingPrefillRequestId = 0;
+const BILLING_FORECAST_CONTEXT = "__billing_forecast__";
+const TENDER_PUBLICATION_CONTEXT = "__tender_publication__";
+let tenderConfig = null;
+let tenderWorkflow = null;
+let tenderSelectedPlot = null;
+let tenderCalculationTimer = null;
 
 // Updated suggestion chips
 const suggestionItems = [
@@ -106,16 +113,53 @@ function setSelectOptions(id, items, valueKey = "value", labelBuilder = (item) =
   });
 }
 
-async function loadBillingRules() {
-  billingRulesPromise = fetch("/api/billing/rules")
-    .then(async (response) => {
+function bindNonNegativeInput(input) {
+  if (!input || input.dataset.nonNegativeBound === "true") return;
+  input.dataset.nonNegativeBound = "true";
+  input.min = "0";
+  if (input.value !== "" && Number(input.value) < 0) input.value = "";
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "-" || event.key === "Subtract") event.preventDefault();
+  });
+  input.addEventListener("input", () => {
+    if (input.value !== "" && Number(input.value) < 0) input.value = "";
+  });
+}
+
+function bindNonNegativeBillingInputs() {
+  document.querySelectorAll("#billing-panel input[type=number]").forEach(bindNonNegativeInput);
+}
+
+async function fetchBillingEndpoint(url, attempts = 12) {
+  let lastError = new Error("Billing data is unavailable.");
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(url);
       const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Billing rules are unavailable.");
+      if (!response.ok) {
+        const error = new Error(data.detail || "Billing data is unavailable.");
+        error.statusCode = response.status;
+        throw error;
+      } else {
+        return data;
+      }
+    } catch (error) {
+      lastError = error;
+      if (error.statusCode && error.statusCode !== 503) throw error;
+    }
+    if (attempt === attempts - 1) throw lastError;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw lastError;
+}
+
+async function loadBillingRules() {
+  billingRulesPromise = fetchBillingEndpoint("/api/billing/rules")
+    .then((data) => {
       billingRules = data;
       setSelectOptions("billing-target-month", data.months);
       setSelectOptions("billing-frequency", data.frequencies);
       setSelectOptions("billing-type", data.categories);
-      setSelectOptions("billing-line-category", data.categories);
       setSelectOptions("billing-structure", data.structures, "value", (item) => `${item.label} · ${Number(item.factor).toFixed(3)}`);
       const targetMonth = document.getElementById("billing-target-month");
       if (targetMonth) targetMonth.value = String(data.defaults.target_month);
@@ -123,8 +167,6 @@ async function loadBillingRules() {
       if (frequency) frequency.value = data.defaults.frequency;
       const category = document.getElementById("billing-type");
       if (category) category.value = data.defaults.category;
-      const lineCategory = document.getElementById("billing-line-category");
-      if (lineCategory) lineCategory.value = data.defaults.category;
       const structure = document.getElementById("billing-structure");
       if (structure) structure.value = data.defaults.structure;
       const ratesContainer = document.getElementById("billing-rates-container");
@@ -137,12 +179,14 @@ async function loadBillingRules() {
           const input = document.createElement("input");
           input.id = `billing-rate-${rate.key}`;
           input.type = "number";
+          input.min = "0";
           input.step = "0.01";
           input.className = "mt-1 h-9 w-full rounded-lg border border-border px-2 text-sm";
           label.appendChild(input);
           ratesContainer.appendChild(label);
         });
       }
+      bindNonNegativeBillingInputs();
     })
     .catch((error) => {
       billingRules = null;
@@ -155,6 +199,121 @@ async function loadBillingRules() {
   return billingRulesPromise;
 }
 
+async function loadBillingTenancies() {
+  const select = document.getElementById("billing-customer-id");
+  if (!select) return;
+  select.replaceChildren();
+  const loading = document.createElement("option");
+  loading.value = "";
+  loading.textContent = "Loading tenancy IDs...";
+  select.appendChild(loading);
+  try {
+    const data = await fetchBillingEndpoint("/api/billing/tenancies");
+    select.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Select a tenancy ID";
+    select.appendChild(placeholder);
+    data.options.forEach((optionData) => {
+      const option = document.createElement("option");
+      option.value = String(optionData.customer_id);
+      option.dataset.tenancyId = String(optionData.tenancy_id);
+      option.textContent = `${optionData.tenancy_id} · Customer ${optionData.customer_id}`;
+      select.appendChild(option);
+    });
+  } catch (error) {
+    select.replaceChildren();
+    const unavailable = document.createElement("option");
+    unavailable.value = "";
+    unavailable.textContent = "Tenancy IDs unavailable";
+    select.appendChild(unavailable);
+    const resultBox = document.getElementById("billing-result");
+    if (resultBox) {
+      resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800";
+      resultBox.textContent = error.message;
+    }
+  }
+}
+
+function setBillingFieldValue(id, value) {
+  const field = document.getElementById(id);
+  if (!field || value === null || value === undefined) return;
+  field.value = String(value);
+}
+
+function resetBillingPrefillFields() {
+  [
+    "billing-present-year", "billing-present-month", "billing-target-year", "billing-present-amount",
+    "billing-present-cgst", "billing-present-sgst", "billing-area",
+  ].forEach((id) => setBillingFieldValue(id, ""));
+  if (billingRules) {
+    setBillingFieldValue("billing-target-month", billingRules.defaults.target_month);
+    setBillingFieldValue("billing-frequency", billingRules.defaults.frequency);
+    setBillingFieldValue("billing-type", billingRules.defaults.category);
+    setBillingFieldValue("billing-structure", billingRules.defaults.structure);
+  }
+  const resultBox = document.getElementById("billing-result");
+  if (resultBox) {
+    resultBox.className = "hidden mt-3 rounded-lg border border-border bg-secondary/60 p-3 text-sm";
+    resultBox.textContent = "";
+  }
+  document.querySelectorAll("#billing-rates-container label").forEach((label) => {
+    label.classList.remove("hidden");
+    const input = label.querySelector("input");
+    if (input) input.value = "";
+  });
+  document.getElementById("billing-rates-details")?.classList.remove("hidden");
+}
+
+async function loadBillingPrefill(tenancyId) {
+  const status = document.getElementById("billing-prefill-status");
+  const requestId = ++billingPrefillRequestId;
+  resetBillingPrefillFields();
+  if (!tenancyId) {
+    if (status) status.textContent = "Select a tenancy to load source-backed billing values.";
+    return;
+  }
+  if (status) {
+    status.className = "mt-1 text-[11px] text-muted-foreground";
+    status.textContent = "Loading source-backed billing values...";
+  }
+  try {
+    const data = await fetchBillingEndpoint(`/api/billing/tenancies/${encodeURIComponent(tenancyId)}/prefill`);
+    if (requestId !== billingPrefillRequestId) return;
+    const fields = data.fields || {};
+    [
+      ["billing-present-year", fields.present_year], ["billing-present-month", fields.present_month],
+      ["billing-target-year", fields.target_year], ["billing-present-amount", fields.present_amount],
+      ["billing-present-cgst", fields.present_cgst], ["billing-present-sgst", fields.present_sgst],
+      ["billing-area", fields.area],
+    ].forEach(([id, value]) => setBillingFieldValue(id, value));
+    setBillingFieldValue("billing-frequency", fields.billing_frequency);
+    setBillingFieldValue("billing-type", fields.bill_type);
+    if (fields.structure_type) setBillingFieldValue("billing-structure", fields.structure_type);
+
+    const allocatedRateKeys = new Set(Array.isArray(data.allocated_rate_keys) ? data.allocated_rate_keys : []);
+    const ratesDetails = document.getElementById("billing-rates-details");
+    if (ratesDetails) ratesDetails.classList.toggle("hidden", allocatedRateKeys.size === 0);
+    document.querySelectorAll("#billing-rates-container label").forEach((label) => {
+      const input = label.querySelector("input");
+      const key = input?.id?.replace("billing-rate-", "");
+      label.classList.toggle("hidden", !allocatedRateKeys.has(key));
+      if (input) input.value = data.rates && data.rates[key] !== undefined ? String(data.rates[key]) : "";
+    });
+    bindNonNegativeBillingInputs();
+    if (status) {
+      status.className = "hidden";
+      status.textContent = "";
+    }
+  } catch (error) {
+    if (requestId !== billingPrefillRequestId) return;
+    if (status) {
+      status.className = "mt-1 text-[11px] text-red-700";
+      status.textContent = error.message;
+    }
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   initIcons();
   loadStoredState();
@@ -164,6 +323,8 @@ document.addEventListener("DOMContentLoaded", () => {
   renderMessages();
   loadUploadedDocuments();
   loadBillingRules();
+  loadBillingTenancies();
+  loadTenderConfig();
   setupEventListeners();
 });
 
@@ -265,6 +426,16 @@ function updateContextDropdown() {
   allOpt.value = "All";
   allOpt.textContent = "All Contexts & Docs";
   select.appendChild(allOpt);
+
+  const billingOpt = document.createElement("option");
+  billingOpt.value = BILLING_FORECAST_CONTEXT;
+  billingOpt.textContent = "Billing Forecast";
+  select.appendChild(billingOpt);
+
+  const tenderOpt = document.createElement("option");
+  tenderOpt.value = TENDER_PUBLICATION_CONTEXT;
+  tenderOpt.textContent = "Tender Publication Workflow";
+  select.appendChild(tenderOpt);
 
   allDocNames.forEach(name => {
     const opt = document.createElement("option");
@@ -843,6 +1014,292 @@ function closeMobileSidebar() {
   if (sidebarBackdrop) sidebarBackdrop.classList.add("hidden");
 }
 
+function openBillingForecastPanel() {
+  const billingPanel = document.getElementById("billing-panel");
+  if (!billingPanel) return;
+  billingPanel.classList.remove("hidden");
+  document.getElementById("billing-customer-id")?.focus();
+}
+
+function tenderResult(message, isError = false) {
+  const box = document.getElementById("tender-result");
+  if (!box) return;
+  box.classList.remove("hidden");
+  box.className = `mt-4 rounded-lg border p-3 text-sm ${isError ? "border-red-300 bg-red-50 text-red-800" : "border-gov-green/30 bg-gov-green/5 text-navy"}`;
+  box.textContent = message;
+}
+
+async function tenderFetch(url, options = {}) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || "Tender workflow request failed.");
+  return data;
+}
+
+async function loadTenderConfig() {
+  try {
+    tenderConfig = await tenderFetch("/api/tender/config");
+    const checklist = document.getElementById("tender-checklist-select");
+    if (checklist) {
+      checklist.replaceChildren();
+      tenderConfig.checklists.forEach((item) => {
+        const option = document.createElement("option");
+        option.value = item.key;
+        option.textContent = item.label;
+        checklist.appendChild(option);
+      });
+    }
+    renderTenderFields();
+  } catch (error) {
+    console.warn("Tender workflow configuration unavailable:", error);
+  }
+}
+
+async function loadTenderPlots() {
+  const select = document.getElementById("tender-plot-select");
+  if (!select) return;
+  const current = select.value;
+  try {
+    const data = await tenderFetch("/api/tender/plots");
+    select.replaceChildren();
+    const initial = document.createElement("option");
+    initial.value = "";
+    initial.textContent = "Select a vacant plot";
+    select.appendChild(initial);
+    data.plots.forEach((plot) => {
+      const option = document.createElement("option");
+      option.value = plot.id;
+      option.textContent = plot.label;
+      select.appendChild(option);
+    });
+    if (Array.from(select.options).some((option) => option.value === current)) select.value = current;
+  } catch (error) {
+    tenderResult(error.message, true);
+  }
+}
+
+function tenderFieldValue(key) {
+  return document.querySelector(`[data-tender-field="${key}"]`)?.value?.trim() || "";
+}
+
+function readTenderFields() {
+  const fields = {};
+  document.querySelectorAll("[data-tender-field]").forEach((input) => { fields[input.dataset.tenderField] = input.value.trim(); });
+  return fields;
+}
+
+function readTenderChecklist() {
+  const answers = {};
+  document.querySelectorAll("[data-tender-checklist]").forEach((input) => { answers[input.dataset.tenderChecklist] = input.value.trim(); });
+  return answers;
+}
+
+function renderTenderFields(values = {}) {
+  const container = document.getElementById("tender-fields-container");
+  if (!container || !tenderConfig) return;
+  container.replaceChildren();
+  tenderConfig.form_fields.forEach((field) => {
+    const label = document.createElement("label");
+    label.className = "text-xs text-muted-foreground";
+    label.textContent = field.label;
+    const input = document.createElement(field.type === "select" ? "select" : "input");
+    input.dataset.tenderField = field.key;
+    input.className = "mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm text-foreground";
+    if (field.type === "number") {
+      input.type = "number";
+      input.min = "0";
+      input.step = "any";
+    } else if (field.type === "select") {
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = "Select";
+      input.appendChild(empty);
+      (field.options || []).forEach((item) => {
+        const option = document.createElement("option");
+        option.value = item;
+        option.textContent = item;
+        input.appendChild(option);
+      });
+    } else {
+      input.type = "text";
+    }
+    input.value = values[field.key] ?? "";
+    input.oninput = () => scheduleTenderCalculation();
+    if (field.source_note) input.title = field.source_note;
+    label.appendChild(input);
+    if (field.source_note) {
+      const note = document.createElement("span");
+      note.className = "mt-1 block text-[10px] text-muted-foreground";
+      note.textContent = field.source_note;
+      label.appendChild(note);
+    }
+    container.appendChild(label);
+  });
+}
+
+function scheduleTenderCalculation() {
+  if (tenderCalculationTimer) clearTimeout(tenderCalculationTimer);
+  tenderCalculationTimer = setTimeout(previewTenderCalculation, 250);
+}
+
+async function previewTenderCalculation() {
+  try {
+    const calculation = await tenderFetch("/api/tender/calculate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields: readTenderFields() }) });
+    renderTenderCalculation(calculation);
+  } catch (error) {
+    renderTenderCalculation({ ready: false, missing_fields: [error.message] });
+  }
+}
+
+function renderTenderChecklist(items = []) {
+  const container = document.getElementById("tender-checklist-container");
+  if (!container) return;
+  container.replaceChildren();
+  if (!items.length) {
+    container.textContent = "Select a checklist to load source-backed checkpoints.";
+    return;
+  }
+  items.forEach((item) => {
+    const label = document.createElement("label");
+    label.className = "block rounded-lg border border-border bg-white p-3 text-xs text-muted-foreground";
+    const title = document.createElement("span");
+    title.className = "block font-medium text-navy";
+    title.textContent = `${item.number}. ${item.label}`;
+    const input = document.createElement("textarea");
+    input.rows = 2;
+    input.dataset.tenderChecklist = item.key;
+    input.className = "mt-2 w-full rounded-lg border border-border p-2 text-sm text-foreground";
+    input.placeholder = "Record verified evidence or the authority response.";
+    input.value = item.answer ?? item.source_answer ?? "";
+    label.append(title, input);
+    container.appendChild(label);
+  });
+}
+
+function formatTenderMoney(value) {
+  const amount = Number(value);
+  return Number.isFinite(amount) ? `INR ${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "Not available";
+}
+
+function renderTenderCalculation(calculation) {
+  const container = document.getElementById("tender-calculation");
+  if (!container) return;
+  container.replaceChildren();
+  if (!calculation || !calculation.ready) {
+    const message = document.createElement("p");
+    message.textContent = calculation?.missing_fields?.length ? `Calculation pending: ${calculation.missing_fields.join(", ")}.` : "Choose a plot and enter approved calculation inputs to prepare the calculation.";
+    container.appendChild(message);
+    return;
+  }
+  const values = [
+    ["Developed area", `${Number(calculation.developed_area_sqm).toLocaleString("en-IN", { maximumFractionDigits: 2 })} sq. m`],
+    ["Base annual rent", formatTenderMoney(calculation.base_annual_rent)],
+    ["Upfront premium before GST", formatTenderMoney(calculation.upfront_premium_before_gst)],
+    ["GST", formatTenderMoney(calculation.gst_amount)],
+    ["Upfront premium including GST", formatTenderMoney(calculation.upfront_premium_including_gst)],
+  ];
+  const list = document.createElement("dl");
+  list.className = "grid gap-2 sm:grid-cols-2";
+  values.forEach(([name, value]) => {
+    const row = document.createElement("div");
+    const term = document.createElement("dt"); term.className = "text-xs text-muted-foreground"; term.textContent = name;
+    const description = document.createElement("dd"); description.className = "font-medium text-navy"; description.textContent = value;
+    row.append(term, description); list.appendChild(row);
+  });
+  container.appendChild(list);
+}
+
+function renderTenderWorkflow(workflow) {
+  tenderWorkflow = workflow || null;
+  renderTenderFields(workflow?.fields || tenderSelectedPlot?.prefill_fields || {});
+  renderTenderChecklist(workflow?.checklist?.items || []);
+  renderTenderCalculation(workflow?.calculation);
+  const status = document.getElementById("tender-status");
+  const actions = document.getElementById("tender-action-buttons");
+  const exports = document.getElementById("tender-export-links");
+  const save = document.getElementById("tender-save-btn");
+  if (status) status.textContent = workflow ? `Current stage: ${workflow.status_label}` : "No workflow draft has been saved yet.";
+  if (save) save.textContent = workflow ? "Save LAC draft" : "Create LAC draft";
+  if (actions) {
+    actions.replaceChildren();
+    (workflow?.available_actions || []).forEach((action) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "rounded-lg border border-navy px-3 py-2 text-sm font-medium text-navy hover:bg-secondary";
+      button.textContent = action.label;
+      button.onclick = () => saveTenderWorkflow(action.key);
+      actions.appendChild(button);
+    });
+  }
+  if (exports) {
+    exports.replaceChildren();
+    if (workflow?.id) {
+      [["lac", "Download LAC draft"], ["board-note", "Download Board Note draft"], ["tender", "Download Tender draft"]].forEach(([kind, label]) => {
+        const link = document.createElement("a");
+        link.className = "rounded-lg border border-border px-3 py-2 text-sm text-navy hover:bg-secondary";
+        link.href = `/api/tender/workflows/${encodeURIComponent(workflow.id)}/documents/${kind}`;
+        link.textContent = label;
+        exports.appendChild(link);
+      });
+    }
+  }
+}
+
+async function loadTenderPlotDetail(plotId) {
+  if (!plotId) return;
+  try {
+    tenderSelectedPlot = await tenderFetch(`/api/tender/plots/${encodeURIComponent(plotId)}`);
+    tenderWorkflow = null;
+    const summary = document.getElementById("tender-plot-summary");
+    if (summary) {
+      summary.classList.remove("hidden");
+      const mapping = tenderSelectedPlot.mapping || {};
+      summary.textContent = `${tenderSelectedPlot.label}. Plot-master mapping: ${mapping.status || "not checked"}. ${tenderSelectedPlot.rate_notice || ""}`;
+    }
+    const checklistKey = document.getElementById("tender-checklist-select")?.value;
+    renderTenderWorkflow({ fields: tenderSelectedPlot.prefill_fields, checklist: { items: [] }, calculation: { ready: false, missing_fields: [] } });
+    if (checklistKey) await loadTenderChecklist(checklistKey);
+  } catch (error) {
+    tenderResult(error.message, true);
+  }
+}
+
+async function loadTenderChecklist(checklistKey) {
+  if (!checklistKey || !tenderSelectedPlot) return;
+  try {
+    const response = await tenderFetch(`/api/tender/checklists/${encodeURIComponent(checklistKey)}`);
+    renderTenderChecklist(response.items || []);
+  } catch (error) {
+    tenderResult(error.message, true);
+  }
+}
+
+async function saveTenderWorkflow(action = "") {
+  const plotId = document.getElementById("tender-plot-select")?.value;
+  const checklistKey = document.getElementById("tender-checklist-select")?.value;
+  if (!plotId || !checklistKey) { tenderResult("Select an eligible vacant plot and LAC checklist first.", true); return; }
+  const body = { fields: readTenderFields(), checklist_answers: readTenderChecklist(), comment: document.getElementById("tender-comment")?.value?.trim() || "" };
+  try {
+    const workflow = tenderWorkflow?.id
+      ? await tenderFetch(`/api/tender/workflows/${encodeURIComponent(tenderWorkflow.id)}/actions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, action: action || "save_draft" }) })
+      : await tenderFetch("/api/tender/workflows", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, plot_id: plotId, checklist_key: checklistKey }) });
+    renderTenderWorkflow(workflow);
+    tenderResult(action ? "Workflow stage updated and recorded." : "LAC draft saved locally.");
+  } catch (error) {
+    tenderResult(error.message, true);
+  }
+}
+
+async function openTenderWorkflowPanel() {
+  const panel = document.getElementById("tender-panel");
+  if (!panel) return;
+  panel.classList.remove("hidden");
+  if (!tenderConfig) await loadTenderConfig();
+  await loadTenderPlots();
+  renderTenderWorkflow(null);
+  document.getElementById("tender-plot-select")?.focus();
+}
+
 // Event Listeners setup
 function setupEventListeners() {
   const form = document.getElementById("chat-form");
@@ -855,19 +1312,43 @@ function setupEventListeners() {
   const closeSidebarBtn = document.getElementById("close-sidebar-btn");
   const sidebarContainer = document.getElementById("sidebar-container");
   const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+  const contextSelect = document.getElementById("context-select");
   const billingPanel = document.getElementById("billing-panel");
-  const billingButton = document.getElementById("billing-forecast-btn");
   const billingClose = document.getElementById("billing-close-btn");
   const billingCancel = document.getElementById("billing-cancel-btn");
   const billingRun = document.getElementById("billing-run-btn");
+  const billingCustomer = document.getElementById("billing-customer-id");
+  const tenderPanel = document.getElementById("tender-panel");
+  const tenderClose = document.getElementById("tender-close-btn");
+  const tenderCancel = document.getElementById("tender-cancel-btn");
+  const tenderReload = document.getElementById("tender-reload-btn");
+  const tenderPlot = document.getElementById("tender-plot-select");
+  const tenderChecklist = document.getElementById("tender-checklist-select");
+  const tenderSave = document.getElementById("tender-save-btn");
 
-  if (billingButton) billingButton.onclick = () => {
-    billingPanel.classList.toggle("hidden");
-    if (!billingPanel.classList.contains("hidden")) document.getElementById("billing-customer-id")?.focus();
+  if (contextSelect) contextSelect.onchange = () => {
+    if (contextSelect.value === BILLING_FORECAST_CONTEXT) {
+      openBillingForecastPanel();
+      contextSelect.value = "Board Note";
+    } else if (contextSelect.value === TENDER_PUBLICATION_CONTEXT) {
+      openTenderWorkflowPanel();
+      contextSelect.value = "Board Note";
+    }
   };
   if (billingClose) billingClose.onclick = () => billingPanel.classList.add("hidden");
   if (billingCancel) billingCancel.onclick = () => billingPanel.classList.add("hidden");
   if (billingRun) billingRun.onclick = runBillingForecast;
+  if (billingCustomer) billingCustomer.onchange = () => {
+    const selected = billingCustomer.selectedOptions?.[0];
+    loadBillingPrefill(selected?.dataset?.tenancyId || "");
+  };
+  if (tenderClose) tenderClose.onclick = () => tenderPanel.classList.add("hidden");
+  if (tenderCancel) tenderCancel.onclick = () => tenderPanel.classList.add("hidden");
+  if (tenderReload) tenderReload.onclick = async () => { await loadTenderConfig(); await loadTenderPlots(); tenderResult("Tender source data reloaded."); };
+  if (tenderPlot) tenderPlot.onchange = () => loadTenderPlotDetail(tenderPlot.value);
+  if (tenderChecklist) tenderChecklist.onchange = () => loadTenderChecklist(tenderChecklist.value);
+  if (tenderSave) tenderSave.onclick = () => saveTenderWorkflow();
+  bindNonNegativeBillingInputs();
   const targetYearInput = document.getElementById("billing-target-year");
   if (targetYearInput && !targetYearInput.value) targetYearInput.value = String(new Date().getFullYear() + 1);
 
@@ -1339,10 +1820,30 @@ async function runBillingForecast() {
   }
   const valueOf = (id) => document.getElementById(id)?.value?.trim() || "";
   const optionalNumber = (id) => valueOf(id) === "" ? null : Number(valueOf(id));
+  const tenancySelect = document.getElementById("billing-customer-id");
+  const selectedTenancy = tenancySelect?.selectedOptions?.[0];
   const customerId = valueOf("billing-customer-id");
+  const tenancyId = selectedTenancy?.dataset?.tenancyId || "";
   const targetYear = optionalNumber("billing-target-year");
   const targetMonth = Number(document.getElementById("billing-target-month").value);
   const billType = document.getElementById("billing-type").value;
+  const nonNegativeIds = [
+    "billing-present-year", "billing-present-month", "billing-target-year",
+    "billing-present-amount", "billing-present-cgst", "billing-present-sgst",
+    "billing-area",
+    ...billingRules.rates.map((rate) => `billing-rate-${rate.key}`),
+  ];
+  const negativeField = nonNegativeIds.find((id) => {
+    const raw = valueOf(id);
+    return raw !== "" && Number.isFinite(Number(raw)) && Number(raw) < 0;
+  });
+  if (negativeField) {
+    const field = document.getElementById(negativeField);
+    if (field) field.focus();
+    resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800";
+    resultBox.textContent = "Negative values are not allowed. Enter zero or a positive value.";
+    return;
+  }
   const rates = {};
   billingRules.rates.forEach((rate) => {
     const value = optionalNumber(`billing-rate-${rate.key}`);
@@ -1350,15 +1851,15 @@ async function runBillingForecast() {
   });
   Object.keys(rates).forEach((key) => { if (rates[key] === null) delete rates[key]; });
   const payload = {
-    customer_id: customerId || null,
+    customer_id: customerId || null, tenancy_id: tenancyId || null,
     present_year: optionalNumber("billing-present-year"), present_month: optionalNumber("billing-present-month"),
     present_amount: optionalNumber("billing-present-amount"), present_cgst: optionalNumber("billing-present-cgst"), present_sgst: optionalNumber("billing-present-sgst"),
-    billing_charge: optionalNumber("billing-charge"), area: optionalNumber("billing-area"), billing_frequency: valueOf("billing-frequency"),
-    target_year: targetYear, target_month: targetMonth, bill_type: billType, line_category: valueOf("billing-line-category"),
+    area: optionalNumber("billing-area"), billing_frequency: valueOf("billing-frequency"),
+    target_year: targetYear, target_month: targetMonth, bill_type: billType,
     structure_type: valueOf("billing-structure"), rates,
   };
-  const requiredFormIds = ["billing-present-year", "billing-present-month", "billing-present-amount", "billing-present-cgst", "billing-present-sgst", "billing-charge", "billing-area", "billing-target-year"];
-  if (requiredFormIds.some((id) => valueOf(id) === "")) { resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800"; resultBox.textContent = "Complete all present bill, target year, charge, and area fields before running the prediction."; return; }
+  const requiredFormIds = ["billing-customer-id", "billing-present-year", "billing-present-month", "billing-present-amount", "billing-present-cgst", "billing-present-sgst", "billing-area", "billing-target-year"];
+  if (requiredFormIds.some((id) => valueOf(id) === "")) { resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800"; resultBox.textContent = "Complete all present bill, target year, and area fields before running the prediction."; return; }
   resultBox.className = "mt-3 rounded-lg border border-border bg-secondary/60 p-3 text-sm";
   resultBox.textContent = "Running forecast...";
   try {
@@ -1369,10 +1870,10 @@ async function runBillingForecast() {
     activePredictionContextId = prediction.context_id;
     if (!isSessionSavedInHistory) {
       isSessionSavedInHistory = true;
-      sessions.unshift({ id: activeSessionId, title: `Billing forecast · ${customerId}`, messages: activeSessionMessages });
+      sessions.unshift({ id: activeSessionId, title: `Billing forecast · ${tenancyId || customerId}`, messages: activeSessionMessages });
       renderHistory();
     }
-    activeSessionMessages.push({ role: "user", text: `Billing forecast for customer ${customerId}, ${billType}, ${targetYear}-${String(targetMonth).padStart(2, "0")}.` });
+    activeSessionMessages.push({ role: "user", text: `Billing forecast for tenancy ${tenancyId || "unknown"}, customer ${customerId}, ${billType}, ${targetYear}-${String(targetMonth).padStart(2, "0")}.` });
     activeSessionMessages.push({ role: "assistant", text: data.summary, prediction, source: "PostgreSQL billing data + XGBoost", isStreaming: false });
     const currentSess = sessions.find(session => session.id === activeSessionId);
     if (currentSess) currentSess.messages = activeSessionMessages;

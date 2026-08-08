@@ -5,15 +5,16 @@ import json
 import shutil
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from app.services.billing_prediction_service import BillingPredictionRequest, BillingPredictionService
+from app.services.tender_workflow_service import TenderWorkflowError, TenderWorkflowService
 
 # Force stdout to UTF-8 on Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -51,6 +52,7 @@ services_loading = False
 init_error = None
 billing_predictor = None
 billing_error = None
+tender_workflow = TenderWorkflowService()
 
 # Track upload/ingestion status per filename
 upload_status = {}
@@ -126,6 +128,7 @@ class ChatRequest(BaseModel):
 
 class BillingRequest(BaseModel):
     customer_id: Optional[str] = None
+    tenancy_id: Optional[str] = None
     target_year: int = 0
     target_month: int = 0
     bill_type: str = ""
@@ -138,11 +141,28 @@ class BillingRequest(BaseModel):
     present_amount: Optional[float] = None
     present_cgst: Optional[float] = None
     present_sgst: Optional[float] = None
-    billing_charge: Optional[float] = None
     billing_frequency: Optional[str] = None
     area: Optional[float] = None
     line_category: Optional[str] = None
     rates: dict[str, float] = Field(default_factory=dict)
+
+
+class TenderWorkflowCreateRequest(BaseModel):
+    plot_id: str
+    checklist_key: str
+    fields: dict[str, Any] = Field(default_factory=dict)
+    checklist_answers: dict[str, str] = Field(default_factory=dict)
+
+
+class TenderWorkflowActionRequest(BaseModel):
+    action: str
+    fields: dict[str, Any] = Field(default_factory=dict)
+    checklist_answers: dict[str, str] = Field(default_factory=dict)
+    comment: str = ""
+
+
+class TenderCalculationRequest(BaseModel):
+    fields: dict[str, Any] = Field(default_factory=dict)
 
 class ChatResponse(BaseModel):
     success: bool
@@ -186,6 +206,32 @@ def billing_rules():
         raise HTTPException(status_code=503, detail=billing_error or "Billing prediction service is still initializing.")
     return billing_predictor.rules_payload()
 
+@app.get("/api/billing/tenancies")
+def billing_tenancies():
+    if billing_predictor is None:
+        raise HTTPException(status_code=503, detail=billing_error or "Billing prediction service is still initializing.")
+    try:
+        return {"options": billing_predictor.tenancy_options()}
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+@app.get("/api/billing/tenancies/{tenancy_id}/prefill")
+def billing_tenancy_prefill(tenancy_id: str):
+    if billing_predictor is None:
+        raise HTTPException(status_code=503, detail=billing_error or "Billing prediction service is still initializing.")
+    try:
+        return billing_predictor.tenancy_prefill(tenancy_id)
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
 @app.post("/api/billing/predict")
 def billing_predict(req: BillingRequest):
     if billing_predictor is None:
@@ -199,6 +245,90 @@ def billing_predict(req: BillingRequest):
         raise HTTPException(status_code=422, detail=str(error))
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.get("/api/tender/config")
+def tender_config():
+    try:
+        return tender_workflow.config_payload()
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+
+
+@app.get("/api/tender/plots")
+def tender_plots():
+    try:
+        return {"plots": tender_workflow.list_plots()}
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+
+
+@app.get("/api/tender/plots/{plot_id}")
+def tender_plot_detail(plot_id: str):
+    try:
+        return tender_workflow.plot_detail(plot_id)
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+@app.get("/api/tender/checklists/{checklist_key}")
+def tender_checklist(checklist_key: str):
+    try:
+        return tender_workflow.checklist(checklist_key)
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+@app.post("/api/tender/calculate")
+def tender_calculate(req: TenderCalculationRequest):
+    try:
+        return tender_workflow.calculate(req.fields)
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+
+
+@app.get("/api/tender/workflows")
+def tender_workflows():
+    return {"workflows": tender_workflow.list_workflows()}
+
+
+@app.post("/api/tender/workflows")
+def tender_create_workflow(req: TenderWorkflowCreateRequest):
+    try:
+        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        return tender_workflow.create_workflow(payload)
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+
+
+@app.get("/api/tender/workflows/{workflow_id}")
+def tender_get_workflow(workflow_id: str):
+    try:
+        return tender_workflow.get_workflow(workflow_id)
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=404, detail=str(error))
+
+
+@app.post("/api/tender/workflows/{workflow_id}/actions")
+def tender_apply_action(workflow_id: str, req: TenderWorkflowActionRequest):
+    try:
+        payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+        return tender_workflow.apply_action(workflow_id, payload)
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+
+
+@app.get("/api/tender/workflows/{workflow_id}/documents/{document_kind}")
+def tender_document(workflow_id: str, document_kind: str):
+    try:
+        content = tender_workflow.document_markdown(workflow_id, document_kind)
+        return Response(
+            content=content,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{document_kind}-{workflow_id}.md"'},
+        )
+    except TenderWorkflowError as error:
+        raise HTTPException(status_code=422, detail=str(error))
 
 def _prediction_requested(question: str) -> bool:
     lowered = question.lower()

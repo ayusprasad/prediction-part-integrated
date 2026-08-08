@@ -10,6 +10,7 @@ this service.
 from __future__ import annotations
 
 import json
+import csv
 import math
 import os
 import re
@@ -72,6 +73,7 @@ def _clean_customer(value: Any) -> Optional[str]:
 @dataclass
 class BillingPredictionRequest:
     customer_id: str = ""
+    tenancy_id: Optional[str] = None
     target_year: int = 0
     target_month: int = 0
     bill_type: str = ""
@@ -84,7 +86,6 @@ class BillingPredictionRequest:
     present_amount: Optional[float] = None
     present_cgst: Optional[float] = None
     present_sgst: Optional[float] = None
-    billing_charge: Optional[float] = None
     billing_frequency: Optional[str] = None
     area: Optional[float] = None
     line_category: Optional[str] = None
@@ -172,12 +173,15 @@ class BillingPredictionService:
     def __init__(self):
         self.rules_path = Path(os.getenv("BILLING_RULES_PATH", str(DEFAULT_RULES_PATH)))
         self.rules = self._read_rules(self.rules_path)
+        configured_tax_mapping = os.getenv("BILLING_TAX_MAPPING_CSV", "").strip()
+        self.tax_mapping_path = Path(configured_tax_mapping) if configured_tax_mapping else None
         self.host = os.getenv("POSTGRES_HOST", "localhost")
         self.port = int(os.getenv("POSTGRES_PORT", "5432"))
         self.dbname = os.getenv("POSTGRES_DB", "postgres")
         self.user = os.getenv("POSTGRES_USER", "postgres")
         self.password = os.getenv("POSTGRES_PASSWORD", "")
         self.schema = os.getenv("POSTGRES_SCHEMA", "rag")
+        self._tax_mapping_cache: Optional[tuple[int, dict[tuple[str, int], int], dict[str, list[list[str]]]]] = None
         configured_limit = os.getenv("BILLING_MAX_FORECAST_MONTHS")
         configured_rule_limit = self.rules.get("max_forecast_months")
         self.max_forecast_months = int(configured_limit) if configured_limit else (int(configured_rule_limit) if configured_rule_limit is not None else None)
@@ -226,6 +230,231 @@ class BillingPredictionService:
                 for rate in self.rules["rates"]
             ],
         }
+
+    @staticmethod
+    def _csv_column_index(headers: list[str], name: str, occurrence: int = 0) -> Optional[int]:
+        matches = [index for index, header in enumerate(headers) if header == name]
+        return matches[occurrence] if occurrence < len(matches) else None
+
+    @staticmethod
+    def _csv_value(row: list[str], columns: dict[tuple[str, int], int], name: str, occurrence: int = 0) -> str:
+        index = columns.get((name, occurrence))
+        return row[index].strip() if index is not None and index < len(row) else ""
+
+    @staticmethod
+    def _csv_bool(value: Any) -> Optional[bool]:
+        text = str(value or "").strip().lower()
+        if text in {"true", "t", "1", "yes", "y"}:
+            return True
+        if text in {"false", "f", "0", "no", "n"}:
+            return False
+        return None
+
+    def _read_tax_mapping_csv(self) -> tuple[dict[tuple[str, int], int], dict[str, list[list[str]]]]:
+        if self.tax_mapping_path is None or not self.tax_mapping_path.exists():
+            raise FileNotFoundError("The configured billing tax-mapping CSV is not available.")
+        modified_ns = self.tax_mapping_path.stat().st_mtime_ns
+        if self._tax_mapping_cache and self._tax_mapping_cache[0] == modified_ns:
+            return self._tax_mapping_cache[1], self._tax_mapping_cache[2]
+
+        with self.tax_mapping_path.open(newline="", encoding="utf-8-sig") as source:
+            reader = csv.reader(source)
+            headers = next(reader, [])
+            tenancy_index = self._csv_column_index(headers, "tenancy_id")
+            if tenancy_index is None:
+                raise ValueError("The tax-mapping CSV does not contain a tenancy_id column.")
+            columns: dict[tuple[str, int], int] = {}
+            seen: dict[str, int] = {}
+            for index, name in enumerate(headers):
+                occurrence = seen.get(name, 0)
+                columns[(name, occurrence)] = index
+                seen[name] = occurrence + 1
+            grouped: dict[str, list[list[str]]] = {}
+            for row in reader:
+                tenancy_id = row[tenancy_index].strip() if len(row) > tenancy_index else ""
+                if tenancy_id:
+                    grouped.setdefault(tenancy_id, []).append(row)
+        self._tax_mapping_cache = (modified_ns, columns, grouped)
+        return columns, grouped
+
+    def tenancy_options(self) -> list[dict[str, str]]:
+        _, grouped = self._read_tax_mapping_csv()
+        tenancy_ids = sorted(grouped)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT trim(customercode), customerid::text
+                    FROM public.mcustomer
+                    WHERE trim(customercode) = ANY(%s)
+                """, (tenancy_ids,))
+                mappings = {str(code).strip(): str(customer_id) for code, customer_id in cur.fetchall()}
+        return [
+            {"tenancy_id": tenancy_id, "customer_id": mappings[tenancy_id]}
+            for tenancy_id in tenancy_ids
+            if tenancy_id in mappings
+        ]
+
+    def tenancy_prefill(self, tenancy_id: str) -> dict[str, Any]:
+        """Return source-backed form values for one CSV tenancy mapping."""
+        selected_tenancy = _clean_customer(tenancy_id)
+        if not selected_tenancy:
+            raise ValueError("tenancy_id is required.")
+        columns, grouped = self._read_tax_mapping_csv()
+        csv_rows = grouped.get(selected_tenancy, [])
+        if not csv_rows:
+            raise ValueError(f"No tax-mapping rows were found for tenancy {selected_tenancy}.")
+
+        first_row = csv_rows[0]
+        csv_frequency = self._normalize_frequency(self._csv_value(first_row, columns, "bill_periodicity", 1))
+        csv_additional_rent = self._csv_bool(self._csv_value(first_row, columns, "has_additional_rent"))
+        csv_structure_id = self._csv_value(first_row, columns, "Structure_type_id")
+
+        with self._connect() as conn:
+            customer_id = self._customer_id_for_tenancy(conn, selected_tenancy)
+            profile = self._load_profile(conn, customer_id)
+            additional_rent = csv_additional_rent
+            if additional_rent is None:
+                additional_rent = profile.get("is_additional_rent")
+            bill_type = "additional_rent" if additional_rent else str(self.rules["defaults"]["category"])
+            model_bill_type = self._model_bill_type(bill_type)
+            history = self._load_history(conn, customer_id, model_bill_type)
+            structure_source = self._load_tenancy_structure(conn, selected_tenancy, csv_structure_id)
+
+        latest = history[-1] if history else None
+        structure_input = self._configured_structure_value(
+            structure_source.get("label"),
+            profile.get("structure_type"),
+            profile.get("main_structure_name"),
+        )
+        frequency = csv_frequency or profile.get("billing_frequency")
+        rates, allocated_rate_keys, matched_tax_rows, rate_warnings = self._csv_formula_rates(csv_rows, columns)
+        warnings = list(rate_warnings)
+        if not history:
+            warnings.append(f"No eligible {self._category_label(bill_type).lower()} history was found for customer {customer_id}.")
+        if frequency is None:
+            warnings.append("No billing frequency was available from the selected tenancy or customer profile.")
+        if structure_input is None:
+            raw_structure = structure_source.get("label") or profile.get("structure_type") or csv_structure_id
+            if raw_structure:
+                warnings.append(f"The source structure '{raw_structure}' has no matching formula structure rule.")
+        if profile.get("area") is None:
+            warnings.append("No property area was found in public.plot for the selected customer.")
+
+        target_year = max(latest["period"][0] + 1, date.today().year + 1) if latest else None
+        target_month = int(self.rules["defaults"]["target_month"]) if latest else None
+        fields = {
+            "present_year": latest["period"][0] if latest else None,
+            "present_month": latest["period"][1] if latest else None,
+            "target_year": target_year,
+            "target_month": target_month,
+            "present_amount": latest["amount"] if latest else None,
+            "present_cgst": latest["cgst"] if latest else None,
+            "present_sgst": latest["sgst"] if latest else None,
+            "area": profile.get("area"),
+            "billing_frequency": frequency,
+            "bill_type": bill_type,
+            "structure_type": structure_input,
+        }
+        return {
+            "tenancy_id": selected_tenancy,
+            "customer_id": customer_id,
+            "fields": fields,
+            "rates": rates,
+            "allocated_rate_keys": allocated_rate_keys,
+            "matched_tax_rows": matched_tax_rows,
+            "warnings": warnings,
+            "sources": {
+                "customer_id": "public.mcustomer.customercode -> customerid",
+                "present_bill": "public.tgeneralbill latest eligible bill for the CSV-derived bill type",
+                "area": "public.plot.area matched by customer code or RR/plot number",
+                "billing_frequency": "CSV applicant_property_mapping.bill_periodicity, then public.mcustomer.billperiodicity",
+                "bill_type": "CSV applicant_property_mapping.has_additional_rent",
+                "structure": "CSV applicant_property_mapping.Structure_type_id joined to public.m_structure_type",
+                "formula_rates": "CSV tax rows with a configured exact tax-name match",
+                "target_period": "Derived from the latest present bill period and configured default target month; not a historical source field",
+            },
+            "tax_allocation_basis": "CSV row presence for the selected tenancy; rows explicitly marked is_applicable=false or is_active=false are excluded. The export has no is_allocated column.",
+        }
+
+    def _customer_id_for_tenancy(self, conn, tenancy_id: str) -> str:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT mc.customerid::text
+                FROM public.mcustomer mc
+                WHERE trim(mc.customercode) = %s
+                ORDER BY mc.customerid::text
+            """, (tenancy_id,))
+            customer_ids = [str(row[0]).strip() for row in cur.fetchall() if row[0] is not None]
+        if not customer_ids:
+            raise ValueError(f"No customer was found in public.mcustomer for tenancy {tenancy_id}.")
+        if len(set(customer_ids)) > 1:
+            raise ValueError(f"Tenancy {tenancy_id} maps to multiple customer IDs in public.mcustomer.")
+        return customer_ids[0]
+
+    def _configured_structure_value(self, *source_values: Any) -> Optional[str]:
+        source_text = " ".join(self._normalise_match_text(value) for value in source_values if value)
+        for structure in self.rules["structures"]:
+            if self._normalise_match_text(structure.get("value")) in source_text:
+                return str(structure["value"])
+            if any(self._normalise_match_text(term) in source_text for term in structure.get("match_terms", [])):
+                return str(structure["value"])
+        return None
+
+    @staticmethod
+    def _normalise_match_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+    def _csv_formula_rates(self, rows: list[list[str]], columns: dict[tuple[str, int], int]) -> tuple[dict[str, float], list[str], list[dict[str, Any]], list[str]]:
+        selected: dict[str, tuple[date, Optional[float], dict[str, Any]]] = {}
+        allocated_keys: set[str] = set()
+        matched_tax_rows: list[dict[str, Any]] = []
+        skipped_explicit = False
+        for row in rows:
+            if self._csv_bool(self._csv_value(row, columns, "is_active")) is False:
+                continue
+            if self._csv_bool(self._csv_value(row, columns, "is_applicable")) is False:
+                skipped_explicit = True
+                continue
+            if self._csv_bool(self._csv_value(row, columns, "applicable_in_report")) is False:
+                continue
+            if self._csv_bool(self._csv_value(row, columns, "tax_in_percent")) is False:
+                continue
+            percent = _number(self._csv_value(row, columns, "tax_percent"))
+            tax_name = self._csv_value(row, columns, "tax_name")
+            tax_short = self._csv_value(row, columns, "tax_name_short")
+            tax_code = self._csv_value(row, columns, "tax_code")
+            valid_from_text = self._csv_value(row, columns, "valid_from")
+            try:
+                valid_from = date.fromisoformat(valid_from_text) if valid_from_text else date.min
+            except ValueError:
+                valid_from = date.min
+            for definition in self.rules["rates"]:
+                match = definition.get("csv_match") or {}
+                names = {self._normalise_match_text(value) for value in match.get("tax_names", [])}
+                shorts = {self._normalise_match_text(value) for value in match.get("tax_name_shorts", [])}
+                codes = {self._normalise_match_text(value) for value in match.get("tax_codes", [])}
+                if not (
+                    self._normalise_match_text(tax_name) in names
+                    or self._normalise_match_text(tax_short) in shorts
+                    or self._normalise_match_text(tax_code) in codes
+                ):
+                    continue
+                key = str(definition["key"])
+                allocated_keys.add(key)
+                item = {"tax_name": tax_name, "tax_code": tax_code, "tax_percent": percent, "valid_from": valid_from_text}
+                current = selected.get(key)
+                if current is None or valid_from >= current[0]:
+                    selected[key] = (valid_from, percent, item)
+        for key, (_, _, item) in selected.items():
+            matched_tax_rows.append(item)
+        matched_tax_rows.sort(key=lambda item: item["tax_name"])
+        rates = {key: item[1] for key, item in selected.items() if item[1] is not None}
+        warnings = ["The CSV export has no is_allocated column; formula-rate visibility uses selected-tenancy row presence and explicit opt-out fields."]
+        if any(item[1] is None for item in selected.values()):
+            warnings.append("At least one allocated formula tax has no percentage in the CSV, so its input was left blank.")
+        if skipped_explicit:
+            warnings.append("Some selected-tenancy tax rows were explicitly marked not applicable and were hidden.")
+        return rates, sorted(allocated_keys), matched_tax_rows, warnings
 
     def _apply_request_defaults(self, request: BillingPredictionRequest) -> None:
         defaults = self.rules["defaults"]
@@ -426,7 +655,6 @@ class BillingPredictionService:
             "present_amount": request.present_amount,
             "present_cgst": request.present_cgst,
             "present_sgst": request.present_sgst,
-            "billing_charge": request.billing_charge,
             "area": request.area,
         }
         missing = [name for name, value in required.items() if value is None]
@@ -475,7 +703,6 @@ class BillingPredictionService:
             target_month=request.target_month,
             structure_type=request.structure_type,
             water_tax_included=True if request.water_tax_included is None else request.water_tax_included,
-            billing_charge=float(request.billing_charge or 0),
             present_amount=float(request.present_amount or 0),
             present_cgst=float(request.present_cgst or 0),
             present_sgst=float(request.present_sgst or 0),
@@ -566,6 +793,7 @@ class BillingPredictionService:
                     mc.rrplotno,
                     mc.customercode,
                     mc.typeofconstructionid,
+                    mc.isadditionalrent,
                     p.area,
                     p.main_structure_name
                 FROM public.mcustomer mc
@@ -589,9 +817,30 @@ class BillingPredictionService:
             "billing_frequency": billing_frequency,
             "rrplotno": row[1],
             "customercode": row[2],
-            "structure_type": row[3] or row[5],
-            "area": _number(row[4]),
+            "structure_type": row[3],
+            "main_structure_name": row[6],
+            "is_additional_rent": self._csv_bool(row[4]),
+            "area": _number(row[5]),
         }
+
+    def _load_tenancy_structure(self, conn, tenancy_id: str, csv_structure_id: str = "") -> dict[str, Any]:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT trim(apm."Structure_type_id"), st.structure_type
+                FROM public.applicant_property_mapping apm
+                LEFT JOIN public.m_structure_type st
+                  ON st.structure_type_id = CASE
+                       WHEN trim(apm."Structure_type_id") ~ '^[0-9]+$'
+                       THEN trim(apm."Structure_type_id")::integer
+                     END
+                WHERE trim(apm.tenancy_id) = %s
+                ORDER BY apm.update_timestamp DESC NULLS LAST
+                LIMIT 1
+            """, (tenancy_id,))
+            row = cur.fetchone()
+        if not row:
+            return {"id": csv_structure_id or None, "label": None}
+        return {"id": row[0] or csv_structure_id or None, "label": row[1] or None}
 
     def _load_rates(self, conn, year: int, month: int) -> dict[str, Any]:
         target = date(year, month, 1)
@@ -697,7 +946,7 @@ class BillingPredictionService:
     @staticmethod
     def _apply_formula_layer(*, rules: dict[str, Any], monthly_base: float, rates: dict[str, float], target_month: int,
                              structure_type: Optional[str], water_tax_included: bool,
-                             billing_charge: float = 0.0, present_amount: float = 0.0,
+                             present_amount: float = 0.0,
                              present_cgst: float = 0.0, present_sgst: float = 0.0) -> dict[str, Any]:
         structure_text = str(structure_type or "").lower()
         structure = next((item for item in rules["structures"] if item["value"] == structure_type), None)
@@ -747,8 +996,7 @@ class BillingPredictionService:
         else:
             schedule = rules.get("unscheduled_formula_label", "")
 
-        area_charge = max(0.0, billing_charge)
-        taxable_base = monthly_base + area_charge
+        taxable_base = monthly_base
         cgst_rate = max(0.0, present_cgst / present_amount) if present_amount > 0 else 0.0
         sgst_rate = max(0.0, present_sgst / present_amount) if present_amount > 0 else 0.0
         predicted_cgst = taxable_base * cgst_rate
@@ -757,7 +1005,6 @@ class BillingPredictionService:
         final_amount = taxable_base + predicted_cgst + predicted_sgst + total_tax
         steps = [
             f"Forecast base amount = INR {monthly_base:,.2f}.",
-            f"Area-linked billing charge = INR {area_charge:,.2f}.",
             f"Predicted CGST = INR {predicted_cgst:,.2f}; predicted SGST = INR {predicted_sgst:,.2f} using the present bill rates.",
             f"Annual amount (AM) = INR {annual_amount:,.2f}.",
             f"Letting value (LV) = INR {letting_value:,.2f}.",
