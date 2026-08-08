@@ -145,6 +145,7 @@ class BillingRequest(BaseModel):
     area: Optional[float] = None
     line_category: Optional[str] = None
     rates: dict[str, float] = Field(default_factory=dict)
+    allocated_rate_keys: list[str] = Field(default_factory=list)
 
 
 class TenderWorkflowCreateRequest(BaseModel):

@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "formula_source_file": "Tax_Formulas_Expanded.md",
   "defaults": {
     "category": "general",
     "target_month": 12,
@@ -57,7 +58,8 @@
     "deduction_rate": 0.9,
     "nrv_divisor": 10,
     "half_year_divisor": 2,
-    "tax_split_divisor": 2
+    "tax_split_divisor": 2,
+    "property_tax_structure": "mbpt"
   },
   "rates": [
     {"key": "general", "label": "General", "database_column": "gen_tax", "csv_match": {"tax_names": ["Property Taxes"], "tax_name_shorts": ["Prop.Tax"]}},

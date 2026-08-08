@@ -90,6 +90,7 @@ class BillingPredictionRequest:
     area: Optional[float] = None
     line_category: Optional[str] = None
     rates: dict[str, float] = field(default_factory=dict)
+    allocated_rate_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -210,6 +211,7 @@ class BillingPredictionService:
         """Return only the configuration needed to render the billing form."""
         return {
             "version": self.rules.get("version"),
+            "formula_source_file": self.rules.get("formula_source_file"),
             "defaults": self.rules["defaults"],
             "max_forecast_months": self.max_forecast_months,
             "months": self.rules["months"],
@@ -607,6 +609,8 @@ class BillingPredictionService:
                 "rates": rates,
                 "bill_type_label": self._category_label(request.bill_type),
                 "forecast_quality": forecast_quality,
+                "formula_notice": formula.get("formula_notice", ""),
+                "formula_source_file": formula.get("formula_source_file"),
             },
         )
         self.contexts[result.context_id] = result
@@ -694,8 +698,20 @@ class BillingPredictionService:
             path.append({"year": next_period[0], "month": next_period[1], "raw": raw, "amount": amount})
             current_period = next_period
 
-        raw_rates = request.rates or {}
-        rates, rate_reasons = self._normalize_rates(raw_rates)
+        raw_rates = dict(request.rates or {})
+        allocated_rate_keys = set(request.allocated_rate_keys or raw_rates.keys())
+        database_rates: dict[str, Any] = {}
+        rate_reasons: list[str] = []
+        try:
+            with self._connect() as conn:
+                database_rates = self._load_rates(conn, request.target_year, request.target_month)
+        except Exception as error:
+            rate_reasons.append(f"Database tax rates were unavailable ({type(error).__name__}); only selected source rates were used.")
+        for key in allocated_rate_keys:
+            if raw_rates.get(key) in (None, "") and key in database_rates:
+                raw_rates[key] = database_rates[key]
+        rates, normalization_reasons = self._normalize_rates(raw_rates)
+        rate_reasons.extend(normalization_reasons)
         formula = self._apply_formula_layer(
             rules=self.rules,
             monthly_base=amount,
@@ -724,7 +740,7 @@ class BillingPredictionService:
             data_source="complete billing form + exported XGBoost model artifact",
             fallback_applied=bool(rate_reasons),
             fallback_reasons=rate_reasons,
-            metadata={"history_points": 1, "forecast_path": path, "billing_frequency": frequency, "rates": rates, "manual_inputs": True, "bill_type_label": self._category_label(request.bill_type), "forecast_quality": forecast_quality},
+            metadata={"history_points": 1, "forecast_path": path, "billing_frequency": frequency, "rates": rates, "database_rates": database_rates, "allocated_rate_keys": sorted(allocated_rate_keys), "manual_inputs": True, "bill_type_label": self._category_label(request.bill_type), "forecast_quality": forecast_quality, "formula_notice": formula.get("formula_notice", ""), "formula_source_file": formula.get("formula_source_file")},
         )
         self.contexts[result.context_id] = result
         return result
@@ -974,6 +990,8 @@ class BillingPredictionService:
             return (half_annual * factor * rate) + (nrvs / tax_split_divisor * rate)
 
         tax_items: list[dict[str, Any]] = []
+        tax_calculation_steps: list[str] = []
+        formula_notice = ""
         if target_month in {item for schedule_item in rules["formula_schedules"] for item in schedule_item.get("months", [])}:
             selected_schedule = next(item for item in rules["formula_schedules"] if target_month in item.get("months", []))
             schedule = selected_schedule["label"]
@@ -981,20 +999,67 @@ class BillingPredictionService:
                 kind = item.get("kind")
                 if kind == "property_tax":
                     property_keys = item.get("rate_keys", [])
-                    value = (nrvs * rates.get(property_keys[0], 0.0) / tax_split_divisor) if property_keys else 0.0
-                    if len(property_keys) > 1:
-                        value += nrvp * rates.get(property_keys[1], 0.0) / tax_split_divisor
-                    if water_tax_included and len(property_keys) > 2:
-                        value += nrvp * rates.get(property_keys[2], 0.0) / tax_split_divisor
+                    property_tax_enabled = structure["value"] == formula_rules.get("property_tax_structure", "mbpt")
+                    general_value = (nrvs * rates.get(property_keys[0], 0.0) / tax_split_divisor) if property_keys and property_tax_enabled else 0.0
+                    sewerage_value = (nrvp * rates.get(property_keys[1], 0.0) / tax_split_divisor) if len(property_keys) > 1 and property_tax_enabled else 0.0
+                    water_value = (nrvp * rates.get(property_keys[2], 0.0) / tax_split_divisor) if len(property_keys) > 2 and water_tax_included and property_tax_enabled else 0.0
+                    value = general_value + sewerage_value + water_value
+                    tax_items.append({
+                        "label": item["label"],
+                        "formula": "(NRVS × General)/2 + (NRVP × Sewerage)/2 + (NRVP × Water)/2",
+                        "components": {"general": general_value, "sewerage": sewerage_value, "water": water_value},
+                        "value": value,
+                    })
+                    if property_tax_enabled:
+                        property_parts = [
+                            f"({nrvs:,.2f} × {rates.get(property_keys[0], 0.0):.2%})/2",
+                            f"({nrvp:,.2f} × {rates.get(property_keys[1], 0.0):.2%})/2",
+                        ]
+                        if len(property_keys) > 2 and water_tax_included:
+                            property_parts.append(f"({nrvp:,.2f} × {rates.get(property_keys[2], 0.0):.2%})/2")
+                        tax_calculation_steps.append(f"{item['label']}: {' + '.join(property_parts)} = INR {value:,.2f}.")
+                    else:
+                        tax_calculation_steps.append(
+                            f"{item['label']}: INR 0.00 because the source formula applies property tax only to the configured MbPT structure."
+                        )
                 elif kind == "dual":
-                    value = dual(rates.get(item.get("rate_key"), 0.0))
+                    rate_key = item.get("rate_key")
+                    rate = rates.get(rate_key, 0.0)
+                    part_a = half_annual * factor * rate
+                    part_b = nrvs / tax_split_divisor * rate
+                    value = part_a + part_b
+                    tax_items.append({
+                        "label": item["label"],
+                        "formula": "((AM/2) × Const × rate) + ((NRVS/2) × rate)",
+                        "components": {"annual_amount_part": part_a, "structure_part": part_b},
+                        "value": value,
+                    })
+                    tax_calculation_steps.append(
+                        f"{item['label']}: (({annual_amount:,.2f}/2) × {factor:.3f} × {rate:.2%}) + "
+                        f"(({nrvs:,.2f}/2) × {rate:.2%}) = INR {value:,.2f}."
+                    )
                 elif kind == "street":
-                    value = nrvp * rates.get(item.get("rate_key"), 0.0) / tax_split_divisor
+                    rate_key = item.get("rate_key")
+                    rate = rates.get(rate_key, 0.0)
+                    value = nrvp * rate / tax_split_divisor
+                    tax_items.append({
+                        "label": item["label"],
+                        "formula": "(NRVP × Street rate) / 2",
+                        "components": {"property_part": value},
+                        "value": value,
+                    })
+                    tax_calculation_steps.append(
+                        f"{item['label']}: ({nrvp:,.2f} × {rate:.2%})/2 = INR {value:,.2f}."
+                    )
                 else:
                     continue
-                tax_items.append({"label": item["label"], "value": value})
         else:
             schedule = rules.get("unscheduled_formula_label", "")
+            formula_notice = (
+                f"No formula tax is billed in target month {target_month}; the source schedule bills pre taxes in April/October "
+                "and post taxes in March/September."
+            )
+            tax_calculation_steps.append(formula_notice)
 
         taxable_base = monthly_base
         cgst_rate = max(0.0, present_cgst / present_amount) if present_amount > 0 else 0.0
@@ -1011,9 +1076,18 @@ class BillingPredictionService:
             f"Net rateable value property (NRVP) = INR {nrvp:,.2f}.",
             f"Net rateable value structure (NRVS) = INR {nrvs:,.2f}.",
             f"Formula schedule = {schedule}; NRV factor = {factor:.3f}.",
+            *tax_calculation_steps,
             f"Formula taxes = INR {total_tax:,.2f}; final predicted amount = INR {final_amount:,.2f}.",
         ]
-        return {"final_amount": final_amount, "formula_schedule": schedule, "tax_items": tax_items, "total_formula_tax": total_tax, "calculation_steps": steps}
+        return {
+            "final_amount": final_amount,
+            "formula_schedule": schedule,
+            "formula_notice": formula_notice,
+            "tax_items": tax_items,
+            "total_formula_tax": total_tax,
+            "calculation_steps": steps,
+            "formula_source_file": rules.get("formula_source_file"),
+        }
 
     def _validate(self, request: BillingPredictionRequest) -> None:
         if not _clean_customer(request.customer_id):

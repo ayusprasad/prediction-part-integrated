@@ -13,6 +13,8 @@ import math
 import re
 import threading
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,6 +92,126 @@ class TenderWorkflowService:
             with path.open("r", encoding="latin-1", newline="") as handle:
                 return list(csv.DictReader(handle))
 
+    def _read_workbook(self) -> list[dict[str, Any]]:
+        """Read cached workbook values without changing the supplied workbook.
+
+        The application only uses cached values and labels from the workbook. It
+        never overwrites formulas or treats a formula reference as an approval.
+        """
+        path = self._source_path("calculation_workbook")
+        main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        document_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        with zipfile.ZipFile(path) as archive:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in archive.namelist():
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root.findall(f"{{{main_ns}}}si"):
+                    shared.append("".join(node.text or "" for node in item.iter(f"{{{main_ns}}}t")))
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            targets = {item.attrib["Id"]: item.attrib["Target"] for item in relationships.findall(f"{{{rel_ns}}}Relationship")}
+            sheets: list[dict[str, Any]] = []
+            for sheet in workbook.find(f"{{{main_ns}}}sheets") or []:
+                relationship_id = sheet.attrib.get(f"{{{document_rel_ns}}}id")
+                target = targets.get(relationship_id, "")
+                if target.startswith("/"):
+                    target = target.lstrip("/")
+                elif not target.startswith("xl/"):
+                    target = f"xl/{target}"
+                if target not in archive.namelist():
+                    continue
+                sheet_root = ET.fromstring(archive.read(target))
+                cells: dict[str, str] = {}
+                for cell in sheet_root.findall(f".//{{{main_ns}}}sheetData/{{{main_ns}}}row/{{{main_ns}}}c"):
+                    value_node = cell.find(f"{{{main_ns}}}v")
+                    inline_node = cell.find(f"{{{main_ns}}}is")
+                    value = ""
+                    if inline_node is not None:
+                        value = "".join(node.text or "" for node in inline_node.iter(f"{{{main_ns}}}t"))
+                    elif value_node is not None:
+                        value = value_node.text or ""
+                        if cell.attrib.get("t") == "s" and value.isdigit():
+                            value = shared[int(value)] if int(value) < len(shared) else ""
+                    cells[cell.attrib.get("r", "")] = value
+                sheets.append({"name": sheet.attrib.get("name", ""), "cells": cells})
+            return sheets
+
+    @staticmethod
+    def _workbook_rows(sheet: dict[str, Any]) -> dict[int, dict[int, str]]:
+        rows: dict[int, dict[int, str]] = {}
+        for reference, value in sheet.get("cells", {}).items():
+            match = re.match(r"^([A-Z]+)(\d+)$", reference)
+            if not match:
+                continue
+            letters, row_number = match.groups()
+            column_number = 0
+            for letter in letters:
+                column_number = column_number * 26 + ord(letter) - 64
+            rows.setdefault(int(row_number), {})[column_number] = value
+        return rows
+
+    @staticmethod
+    def _number(value: Any) -> float | None:
+        text = str(value or "").replace(",", "").strip()
+        try:
+            number = float(text)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _workbook_value_after(self, rows: dict[int, dict[int, str]], pattern: str, numeric: bool = False) -> str:
+        expression = re.compile(pattern, re.IGNORECASE)
+        for row in rows.values():
+            ordered = sorted(row.items())
+            for index, (_, value) in enumerate(ordered):
+                if not expression.search(str(value or "")):
+                    continue
+                candidates = [
+                    candidate for _, candidate in ordered[index + 1:]
+                    if str(candidate or "").strip() and str(candidate).strip() not in {":", "="}
+                ]
+                if numeric:
+                    for candidate in candidates:
+                        if self._number(candidate) is not None:
+                            return str(candidate).strip()
+                elif candidates:
+                    return str(candidates[0]).strip()
+        return ""
+
+    def workbook_scenarios(self) -> list[dict[str, Any]]:
+        scenarios: list[dict[str, Any]] = []
+        for sheet in self._read_workbook():
+            rows = self._workbook_rows(sheet)
+            all_text = " ".join(value for row in rows.values() for value in row.values())
+            years = re.search(r"FOR\s+(\d+)\s+YEARS", all_text, re.IGNORECASE)
+            scenario = {
+                "sheet": sheet["name"],
+                "plot_name": self._workbook_value_after(rows, r"Plot No:", numeric=False),
+                "area_sqm": self._workbook_value_after(rows, r"PLOT AREA", numeric=True),
+                "lease_years": years.group(1) if years else "",
+                "fsi": self._workbook_value_after(rows, r"^FSI$", numeric=True),
+                "ready_reckoner_zone": self._workbook_value_after(rows, r"ZONE AS PER READY RECKONER", numeric=False),
+                "sor_rate": self._workbook_value_after(rows, r"RATE (?:PER SQ\.\s*MTR\.\s*PER MONTH|AS PER SOR)", numeric=True),
+                "discount_rate_percent": self._workbook_value_after(rows, r"Discounting Factor", numeric=True),
+                "source_file": self._source_path("calculation_workbook").name,
+            }
+            scenarios.append(scenario)
+        return scenarios
+
+    def _workbook_matches(self, vacant_row: dict[str, str]) -> list[dict[str, Any]]:
+        vacant_text = " ".join(str(v or "") for v in vacant_row.values()).casefold()
+        vacant_area = self._number(vacant_row.get("area"))
+        matches = []
+        for scenario in self.workbook_scenarios():
+            scenario_text = str(scenario.get("plot_name", "")).casefold().strip()
+            scenario_area = self._number(scenario.get("area_sqm"))
+            name_match = bool(scenario_text and scenario_text in vacant_text)
+            area_match = vacant_area is not None and scenario_area is not None and abs(vacant_area - scenario_area) < 0.01
+            if name_match or area_match:
+                matches.append({**scenario, "match_basis": "plot text" if name_match else "exact area"})
+        return matches
+
     def _load_records(self) -> list[dict[str, Any]]:
         if not self.storage_path.exists():
             return []
@@ -111,7 +233,7 @@ class TenderWorkflowService:
 
     @staticmethod
     def _plot_label(row: dict[str, str]) -> str:
-        values = [row.get("bill_code"), row.get("plot_no"), row.get("plot_name"), row.get("village")]
+        values = [row.get("bill_code"), row.get("plot_no"), row.get("plot_details"), row.get("division")]
         return " · ".join(str(value).strip() for value in values if str(value or "").strip())
 
     def list_plots(self) -> list[dict[str, Any]]:
@@ -125,7 +247,7 @@ class TenderWorkflowService:
                     "area_sqm": row.get("area", ""),
                     "ready_recknor_zone": row.get("ready_recknor_zone", ""),
                     "source_status": row.get("status", ""),
-                    "reference_rr_rate": row.get("rr_rate", ""),
+                    "reference_rr_rate": row.get("rate_per_sq_mtr_rr", ""),
                 }
             )
         return plots
@@ -157,8 +279,8 @@ class TenderWorkflowService:
                     {
                         "plot_id": match.get("plot_id", ""),
                         "plot_code": match.get("plot_code", ""),
-                        "plot_name": match.get("plot_name", ""),
-                        "estate_name": match.get("estate_name", ""),
+                        "plot_name": match.get("main_structure_name", ""),
+                        "location": match.get("location", ""),
                     }
                 ],
             }
@@ -169,8 +291,8 @@ class TenderWorkflowService:
                     {
                         "plot_id": match.get("plot_id", ""),
                         "plot_code": match.get("plot_code", ""),
-                        "plot_name": match.get("plot_name", ""),
-                        "estate_name": match.get("estate_name", ""),
+                        "plot_name": match.get("main_structure_name", ""),
+                        "location": match.get("location", ""),
                     }
                     for match in matches[:10]
                 ],
@@ -213,12 +335,39 @@ class TenderWorkflowService:
             )
         return rows
 
+    @staticmethod
+    def _checklist_header_values(path: Path) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lstrip().startswith("|") or line.startswith("### Table"):
+                break
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            label = re.sub(r"\s+", " ", label).strip().casefold()
+            value = re.sub(r"\s+", " ", value).strip()
+            if label and value:
+                values[label] = value
+        return values
+
     def checklist(self, checklist_key: str) -> dict[str, Any]:
         checklist = self._checklists_by_key().get(checklist_key)
         if not checklist:
             raise TenderWorkflowError("Select a valid LAC checklist.")
         path = self._source_path(checklist["source_key"])
-        return {"key": checklist_key, "label": checklist["label"], "source_file": path.name, "items": self._table_rows_from_markdown(path)}
+        header_values = self._checklist_header_values(path)
+        prefill_fields: dict[str, str] = {}
+        tender_method = header_values.get("proposed for govt. organization") or header_values.get("proposed for govt organization")
+        if tender_method:
+            prefill_fields["tender_method"] = tender_method
+        return {
+            "key": checklist_key,
+            "label": checklist["label"],
+            "source_file": path.name,
+            "header_values": header_values,
+            "prefill_fields": prefill_fields,
+            "items": self._table_rows_from_markdown(path),
+        }
 
     def config_payload(self) -> dict[str, Any]:
         config = self._config()
@@ -236,14 +385,36 @@ class TenderWorkflowService:
         mapping = self._match_plot_master(row)
         source_snapshot = {
             key: row.get(key, "")
-            for key in ("bill_code", "plot_no", "plot_name", "village", "area", "ready_recknor_zone", "rr_rate", "status", "reservation", "remark")
+            for key in (
+                "bill_code", "plot_no", "division", "area", "ready_recknor_zone",
+                "rate_per_sq_mtr_rr", "status", "reservation_as_per_mbpt_master_plan",
+                "reservation_as_per_final_dp_mcgm", "zone_as_per_dp_mcgm", "remarks", "plot_details",
+            )
         }
+        workbook_matches = self._workbook_matches(row)
+        workbook_prefill: dict[str, Any] = {}
+        if len(workbook_matches) == 1:
+            workbook_match = workbook_matches[0]
+            for field_key, source_key in (
+                ("lease_years", "lease_years"),
+                ("fsi", "fsi"),
+                ("approved_monthly_sor_rate", "sor_rate"),
+                ("discount_rate_percent", "discount_rate_percent"),
+            ):
+                if workbook_match.get(source_key) not in (None, ""):
+                    workbook_prefill[field_key] = workbook_match[source_key]
         return {
             "id": str(plot_id),
             "label": self._plot_label(row),
-            "prefill_fields": {"area_sqm": row.get("area", "")},
+            "prefill_fields": {"area_sqm": row.get("area", ""), **workbook_prefill},
             "source_snapshot": source_snapshot,
             "mapping": mapping,
+            "workbook_matches": workbook_matches,
+            "workbook_prefill_status": (
+                "Matched one workbook scenario by exact source text/area; verify and approve the values before submission."
+                if len(workbook_matches) == 1
+                else "No unique workbook scenario matched this selected vacant-plot record; workbook values were not copied."
+            ),
             "rate_notice": "The source RR rate is retained as a reference only. Enter an approved monthly SoR rate from the applicable approved schedule; no rate is inferred from this CSV.",
         }
 
@@ -355,6 +526,9 @@ class TenderWorkflowService:
         detail = self.plot_detail(plot_id)
         checklist = self.checklist(checklist_key)
         fields = self._sanitize_fields(payload.get("fields"))
+        for key, value in checklist.get("prefill_fields", {}).items():
+            if fields.get(key) in (None, ""):
+                fields[key] = value
         if not fields.get("area_sqm") and detail["prefill_fields"].get("area_sqm"):
             fields["area_sqm"] = self._clean_number(detail["prefill_fields"]["area_sqm"], "Area")
         now = self._now()

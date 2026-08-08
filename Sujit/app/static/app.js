@@ -218,8 +218,10 @@ async function loadBillingTenancies() {
       const option = document.createElement("option");
       option.value = String(optionData.customer_id);
       option.dataset.tenancyId = String(optionData.tenancy_id);
+      option.textContent = String(optionData.tenancy_id);
       option.textContent = `${optionData.tenancy_id} · Customer ${optionData.customer_id}`;
       select.appendChild(option);
+      option.textContent = String(optionData.tenancy_id);
     });
   } catch (error) {
     select.replaceChildren();
@@ -770,10 +772,11 @@ function stripPredictionNotes(text) {
 
 function renderPredictionHtml(prediction) {
   if (!prediction) return '';
-  const rows = (prediction.tax_items || []).map(item => `<div class="flex justify-between gap-3"><span>${escapeHtml(String(item.label))}</span><span class="font-mono">INR ${Number(item.value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div>`).join('');
+  const rows = (prediction.tax_items || []).map(item => `<div><div class="flex justify-between gap-3"><span>${escapeHtml(String(item.label))}</span><span class="font-mono">INR ${Number(item.value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div>${item.formula ? `<div class="text-[11px] text-muted-foreground">${escapeHtml(String(item.formula))}</div>` : ''}</div>`).join('');
   const steps = (prediction.calculation_steps || []).map(step => `<li>${escapeHtml(String(step))}</li>`).join('');
   const schedule = escapeHtml(String(prediction.formula_schedule || ""));
-  return `<div class="mt-3 rounded-lg border border-gold/30 bg-white p-3 text-xs"><div class="font-semibold text-navy mb-2">Forecast breakdown</div><div class="space-y-1">${rows || `<div>${schedule}</div>`}</div><div class="mt-2 pt-2 border-t border-border font-semibold flex justify-between"><span>Final predicted amount</span><span class="text-gov-green">INR ${Number(prediction.final_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div><details class="mt-2"><summary class="cursor-pointer text-navy font-medium">Calculation steps</summary><ol class="list-decimal ml-4 mt-1 space-y-1 text-muted-foreground">${steps}</ol></details></div>`;
+  const formulaNotice = escapeHtml(String(prediction.metadata?.formula_notice || ""));
+  return `<div class="mt-3 rounded-lg border border-gold/30 bg-white p-3 text-xs"><div class="font-semibold text-navy mb-2">Forecast breakdown</div><div class="space-y-2">${rows || `<div>${formulaNotice || schedule}</div>`}</div><div class="mt-2 pt-2 border-t border-border font-semibold flex justify-between"><span>Final predicted amount</span><span class="text-gov-green">INR ${Number(prediction.final_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span></div><details class="mt-2"><summary class="cursor-pointer text-navy font-medium">Calculation steps</summary><ol class="list-decimal ml-4 mt-1 space-y-1 text-muted-foreground">${steps}</ol></details></div>`;
 }
 
 // Smooth Direct DOM Update for Real-Time Streaming (Zero Blinking!)
@@ -1123,7 +1126,14 @@ function renderTenderFields(values = {}) {
     } else {
       input.type = "text";
     }
-    input.value = values[field.key] ?? "";
+    const sourceValue = values[field.key] ?? "";
+    if (field.type === "select" && sourceValue && !Array.from(input.options).some((option) => option.value === String(sourceValue))) {
+      const sourceOption = document.createElement("option");
+      sourceOption.value = sourceValue;
+      sourceOption.textContent = `${sourceValue} (from source checklist)`;
+      input.appendChild(sourceOption);
+    }
+    input.value = sourceValue;
     input.oninput = () => scheduleTenderCalculation();
     if (field.source_note) input.title = field.source_note;
     label.appendChild(input);
@@ -1254,7 +1264,11 @@ async function loadTenderPlotDetail(plotId) {
     if (summary) {
       summary.classList.remove("hidden");
       const mapping = tenderSelectedPlot.mapping || {};
-      summary.textContent = `${tenderSelectedPlot.label}. Plot-master mapping: ${mapping.status || "not checked"}. ${tenderSelectedPlot.rate_notice || ""}`;
+      const workbookMatch = tenderSelectedPlot.workbook_matches?.[0];
+      const workbookText = workbookMatch
+        ? `Workbook match: ${workbookMatch.sheet} (${workbookMatch.match_basis}).`
+        : (tenderSelectedPlot.workbook_prefill_status || "Workbook values were not copied.");
+      summary.textContent = `${tenderSelectedPlot.label}. Plot-master mapping: ${mapping.status || "not checked"}. ${workbookText} ${tenderSelectedPlot.rate_notice || ""}`;
     }
     const checklistKey = document.getElementById("tender-checklist-select")?.value;
     renderTenderWorkflow({ fields: tenderSelectedPlot.prefill_fields, checklist: { items: [] }, calculation: { ready: false, missing_fields: [] } });
@@ -1268,7 +1282,10 @@ async function loadTenderChecklist(checklistKey) {
   if (!checklistKey || !tenderSelectedPlot) return;
   try {
     const response = await tenderFetch(`/api/tender/checklists/${encodeURIComponent(checklistKey)}`);
+    const existingFields = readTenderFields();
+    renderTenderFields({ ...(tenderSelectedPlot?.prefill_fields || {}), ...existingFields, ...(response.prefill_fields || {}) });
     renderTenderChecklist(response.items || []);
+    scheduleTenderCalculation();
   } catch (error) {
     tenderResult(error.message, true);
   }
@@ -1850,13 +1867,16 @@ async function runBillingForecast() {
     if (value !== null) rates[rate.key] = value;
   });
   Object.keys(rates).forEach((key) => { if (rates[key] === null) delete rates[key]; });
+  const allocatedRateKeys = billingRules.rates
+    .filter((rate) => !document.getElementById(`billing-rate-${rate.key}`)?.closest("label")?.classList.contains("hidden"))
+    .map((rate) => rate.key);
   const payload = {
     customer_id: customerId || null, tenancy_id: tenancyId || null,
     present_year: optionalNumber("billing-present-year"), present_month: optionalNumber("billing-present-month"),
     present_amount: optionalNumber("billing-present-amount"), present_cgst: optionalNumber("billing-present-cgst"), present_sgst: optionalNumber("billing-present-sgst"),
     area: optionalNumber("billing-area"), billing_frequency: valueOf("billing-frequency"),
     target_year: targetYear, target_month: targetMonth, bill_type: billType,
-    structure_type: valueOf("billing-structure"), rates,
+    structure_type: valueOf("billing-structure"), rates, allocated_rate_keys: allocatedRateKeys,
   };
   const requiredFormIds = ["billing-customer-id", "billing-present-year", "billing-present-month", "billing-present-amount", "billing-present-cgst", "billing-present-sgst", "billing-area", "billing-target-year"];
   if (requiredFormIds.some((id) => valueOf(id) === "")) { resultBox.className = "mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800"; resultBox.textContent = "Complete all present bill, target year, and area fields before running the prediction."; return; }
