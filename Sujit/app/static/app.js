@@ -1264,11 +1264,7 @@ async function loadTenderPlotDetail(plotId) {
     if (summary) {
       summary.classList.remove("hidden");
       const mapping = tenderSelectedPlot.mapping || {};
-      const workbookMatch = tenderSelectedPlot.workbook_matches?.[0];
-      const workbookText = workbookMatch
-        ? `Workbook match: ${workbookMatch.sheet} (${workbookMatch.match_basis}).`
-        : (tenderSelectedPlot.workbook_prefill_status || "Workbook values were not copied.");
-      summary.textContent = `${tenderSelectedPlot.label}. Plot-master mapping: ${mapping.status || "not checked"}. ${workbookText} ${tenderSelectedPlot.rate_notice || ""}`;
+      summary.textContent = `${tenderSelectedPlot.label}. Source: ${mapping.reason || mapping.status || "not available"}. ${tenderSelectedPlot.workbook_prefill_status || ""} ${tenderSelectedPlot.rate_notice || ""}`;
     }
     const checklistKey = document.getElementById("tender-checklist-select")?.value;
     renderTenderWorkflow({ fields: tenderSelectedPlot.prefill_fields, checklist: { items: [] }, calculation: { ready: false, missing_fields: [] } });

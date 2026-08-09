@@ -228,77 +228,62 @@ class TenderWorkflowService:
         temporary.replace(self.storage_path)
 
     def _eligible_vacant_rows(self) -> list[dict[str, str]]:
-        statuses = {self._normalise(item) for item in self._config().get("eligible_plot_statuses", [])}
-        return [row for row in self._read_csv("vacant_plot_master") if self._normalise(row.get("status")) in statuses]
+        source = self._config().get("plot_source", {})
+        source_key = source.get("source_key")
+        eligibility_field = source.get("eligibility_field")
+        eligible_values = {self._normalise(value) for value in source.get("eligible_values", [])}
+        if not source_key or not eligibility_field or not eligible_values:
+            raise TenderWorkflowError("Tender plot-source configuration is incomplete.")
+        return [
+            row
+            for row in self._read_csv(source_key)
+            if self._normalise(row.get(eligibility_field)) in eligible_values
+        ]
 
-    @staticmethod
-    def _plot_label(row: dict[str, str]) -> str:
-        values = [row.get("bill_code"), row.get("plot_no"), row.get("plot_details"), row.get("division")]
-        return " · ".join(str(value).strip() for value in values if str(value or "").strip())
+    def _plot_id(self, row: dict[str, str]) -> str:
+        field = self._config().get("plot_source", {}).get("id_field")
+        value = str(row.get(field, "") if field else "").strip()
+        if not value:
+            raise TenderWorkflowError("Tender plot source has a record without its configured identifier.")
+        return value
+
+    def _plot_label(self, row: dict[str, str]) -> str:
+        fields = self._config().get("plot_source", {}).get("display_fields", [])
+        values = [str(row.get(field, "")).strip() for field in fields]
+        return " · ".join(value for value in values if value)
 
     def list_plots(self) -> list[dict[str, Any]]:
         plots: list[dict[str, Any]] = []
-        for index, row in enumerate(self._eligible_vacant_rows()):
+        for row in self._eligible_vacant_rows():
             plots.append(
                 {
-                    "id": str(index),
-                    "label": self._plot_label(row) or f"Vacant plot {index + 1}",
-                    "bill_code": row.get("bill_code", ""),
-                    "area_sqm": row.get("area", ""),
-                    "ready_recknor_zone": row.get("ready_recknor_zone", ""),
-                    "source_status": row.get("status", ""),
-                    "reference_rr_rate": row.get("rate_per_sq_mtr_rr", ""),
+                    "id": self._plot_id(row),
+                    "label": self._plot_label(row) or f"Vacant plot {self._plot_id(row)}",
+                    "plot_code": row.get("plot_code", ""),
+                    "area_sqm": row.get("plot_area_sqm", ""),
+                    "source_status": row.get("plot_status", ""),
                 }
             )
         return plots
 
     def _vacant_plot(self, plot_id: str) -> dict[str, str]:
-        try:
-            index = int(str(plot_id))
-        except (TypeError, ValueError) as error:
-            raise TenderWorkflowError("Select an eligible vacant plot.") from error
-        rows = self._eligible_vacant_rows()
-        if index < 0 or index >= len(rows):
+        requested_id = str(plot_id).strip()
+        row = next((item for item in self._eligible_vacant_rows() if self._plot_id(item) == requested_id), None)
+        if not row:
             raise TenderWorkflowError("The selected vacant plot is no longer eligible.")
-        return rows[index]
+        return row
 
     def _match_plot_master(self, vacant_row: dict[str, str]) -> dict[str, Any]:
-        bill_code = self._normalise(vacant_row.get("bill_code"))
-        if not bill_code:
-            return {"status": "unmatched", "matches": [], "reason": "The vacant-plot record has no bill code."}
-        candidate_columns = ("plot_code", "customer_code", "existing_plot_no", "mcgm_plot_no")
-        matches: list[dict[str, str]] = []
-        for row in self._read_csv("plot_master"):
-            if any(self._normalise(row.get(column)) == bill_code for column in candidate_columns):
-                matches.append(row)
-        if len(matches) == 1:
-            match = matches[0]
-            return {
-                "status": "matched",
-                "matches": [
-                    {
-                        "plot_id": match.get("plot_id", ""),
-                        "plot_code": match.get("plot_code", ""),
-                        "plot_name": match.get("main_structure_name", ""),
-                        "location": match.get("location", ""),
-                    }
-                ],
-            }
-        if len(matches) > 1:
-            return {
-                "status": "ambiguous",
-                "matches": [
-                    {
-                        "plot_id": match.get("plot_id", ""),
-                        "plot_code": match.get("plot_code", ""),
-                        "plot_name": match.get("main_structure_name", ""),
-                        "location": match.get("location", ""),
-                    }
-                    for match in matches[:10]
-                ],
-                "reason": "More than one plot-master record matches the bill code; review is required.",
-            }
-        return {"status": "unmatched", "matches": [], "reason": "No exact plot-master match was found for the bill code."}
+        return {
+            "status": "source_record",
+            "matches": [{
+                "plot_id": self._plot_id(vacant_row),
+                "plot_code": vacant_row.get("plot_code", ""),
+                "plot_name": vacant_row.get("main_structure_name", ""),
+                "location": vacant_row.get("location", ""),
+            }],
+            "reason": "Plot context is sourced directly from the public-database export; no cross-file matching is used.",
+        }
 
     @staticmethod
     def _table_rows_from_markdown(path: Path) -> list[dict[str, str]]:
@@ -383,39 +368,22 @@ class TenderWorkflowService:
     def plot_detail(self, plot_id: str) -> dict[str, Any]:
         row = self._vacant_plot(plot_id)
         mapping = self._match_plot_master(row)
-        source_snapshot = {
-            key: row.get(key, "")
-            for key in (
-                "bill_code", "plot_no", "division", "area", "ready_recknor_zone",
-                "rate_per_sq_mtr_rr", "status", "reservation_as_per_mbpt_master_plan",
-                "reservation_as_per_final_dp_mcgm", "zone_as_per_dp_mcgm", "remarks", "plot_details",
-            )
+        source = self._config().get("plot_source", {})
+        source_snapshot = {key: row.get(key, "") for key in source.get("snapshot_fields", [])}
+        prefill_fields = {
+            target_field: row.get(source_field, "")
+            for target_field, source_field in source.get("prefill_fields", {}).items()
+            if row.get(source_field, "") not in (None, "")
         }
-        workbook_matches = self._workbook_matches(row)
-        workbook_prefill: dict[str, Any] = {}
-        if len(workbook_matches) == 1:
-            workbook_match = workbook_matches[0]
-            for field_key, source_key in (
-                ("lease_years", "lease_years"),
-                ("fsi", "fsi"),
-                ("approved_monthly_sor_rate", "sor_rate"),
-                ("discount_rate_percent", "discount_rate_percent"),
-            ):
-                if workbook_match.get(source_key) not in (None, ""):
-                    workbook_prefill[field_key] = workbook_match[source_key]
         return {
             "id": str(plot_id),
             "label": self._plot_label(row),
-            "prefill_fields": {"area_sqm": row.get("area", ""), **workbook_prefill},
+            "prefill_fields": prefill_fields,
             "source_snapshot": source_snapshot,
             "mapping": mapping,
-            "workbook_matches": workbook_matches,
-            "workbook_prefill_status": (
-                "Matched one workbook scenario by exact source text/area; verify and approve the values before submission."
-                if len(workbook_matches) == 1
-                else "No unique workbook scenario matched this selected vacant-plot record; workbook values were not copied."
-            ),
-            "rate_notice": "The source RR rate is retained as a reference only. Enter an approved monthly SoR rate from the applicable approved schedule; no rate is inferred from this CSV.",
+            "workbook_matches": [],
+            "workbook_prefill_status": "Case-example workbook values are not copied into a new tender workflow.",
+            "rate_notice": "No approved current SoR/rate record is available in the public export. Enter or import an approved case-specific rate before calculating.",
         }
 
     def _field_definitions(self) -> dict[str, dict[str, Any]]:
@@ -678,3 +646,14 @@ class TenderWorkflowService:
         for event in workflow.get("events", []):
             lines.append(f"| {event['at']} | {event['action']} | {event.get('from') or ''} | {event.get('to') or ''} | {event.get('comment', '').replace('|', '/')} |")
         return "\n".join(lines) + "\n"
+
+    def document_pdf(self, workflow_id: str, kind: str) -> bytes:
+        """Render a downloaded workflow document as a formatted PDF."""
+        if kind not in {"lac", "board-note", "tender"}:
+            raise TenderWorkflowError("Document type must be lac, board-note, or tender.")
+        try:
+            from app.services.tender_document_pdf import build_tender_document_pdf
+
+            return build_tender_document_pdf(self.get_workflow(workflow_id), self._config(), kind)
+        except ImportError as error:
+            raise TenderWorkflowError("PDF generation dependency is unavailable. Install the project requirements and restart the server.") from error

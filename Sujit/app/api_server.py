@@ -322,11 +322,11 @@ def tender_apply_action(workflow_id: str, req: TenderWorkflowActionRequest):
 @app.get("/api/tender/workflows/{workflow_id}/documents/{document_kind}")
 def tender_document(workflow_id: str, document_kind: str):
     try:
-        content = tender_workflow.document_markdown(workflow_id, document_kind)
+        content = tender_workflow.document_pdf(workflow_id, document_kind)
         return Response(
             content=content,
-            media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{document_kind}-{workflow_id}.md"'},
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{document_kind}-{workflow_id}.pdf"'},
         )
     except TenderWorkflowError as error:
         raise HTTPException(status_code=422, detail=str(error))
