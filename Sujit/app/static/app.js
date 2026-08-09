@@ -1219,9 +1219,41 @@ function renderTenderCalculation(calculation) {
   container.appendChild(list);
 }
 
+function formatTenderSourceLabel(key) {
+  return String(key || "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function renderTenderSourceContext(snapshot = {}) {
+  const section = document.getElementById("tender-source-context-section");
+  const container = document.getElementById("tender-source-context");
+  if (!section || !container) return;
+  container.replaceChildren();
+  const values = Object.entries(snapshot || {}).filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== "");
+  if (!values.length) {
+    section.classList.add("hidden");
+    return;
+  }
+  values.forEach(([key, value]) => {
+    const item = document.createElement("div");
+    item.className = "rounded-lg border border-border bg-white p-3";
+    const label = document.createElement("dt");
+    label.className = "text-xs font-medium text-muted-foreground";
+    label.textContent = formatTenderSourceLabel(key);
+    const detail = document.createElement("dd");
+    detail.className = "mt-1 break-words text-sm font-medium text-navy";
+    detail.textContent = String(value);
+    item.append(label, detail);
+    container.appendChild(item);
+  });
+  section.classList.remove("hidden");
+}
+
 function renderTenderWorkflow(workflow) {
   tenderWorkflow = workflow || null;
   renderTenderFields(workflow?.fields || tenderSelectedPlot?.prefill_fields || {});
+  renderTenderSourceContext(workflow?.source_snapshot || tenderSelectedPlot?.source_snapshot || {});
   renderTenderChecklist(workflow?.checklist?.items || []);
   renderTenderCalculation(workflow?.calculation);
   const status = document.getElementById("tender-status");
