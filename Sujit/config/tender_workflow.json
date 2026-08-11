@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "source_files": {
     "procedure": "Procedure for Publishing Tender.md",
     "plot_master": "plot_202608082105.csv",
@@ -33,18 +33,31 @@
     {"key": "embarkation", "label": "Embarkation / STC LAC checklist", "source_key": "embarkation_checklist"},
     {"key": "stp", "label": "STP LAC checklist", "source_key": "stp_checklist"}
   ],
+  "calculation_rules": {
+    "months_per_year": 12,
+    "formula_source": "The selected calculation basis uses the approved commercial input and the NPV formula demonstrated in the workbook. Case-specific workbook values are prefilled only after an exact plot match.",
+    "structure_area_rule": "When structure is selected, the verified structure area is used as the chargeable area. Otherwise chargeable area equals plot area multiplied by approved FSI.",
+    "service_charge_rule": "Service charge is displayed separately from rent/upfront consideration because the supplied workbook records it as separately payable; it is not added to the NPV without an approved case formula."
+  },
   "form_fields": [
-    {"key": "area_sqm", "label": "Area (sq. m)", "type": "number", "step": "0.01", "source_field": "area", "required_for": ["calculate"], "source_note": "Prefilled from the selected vacant-plot record when available; verify by joint survey."},
-    {"key": "proposed_use", "label": "Proposed use", "type": "text", "required_for": ["submit_lac", "generate_board_note", "generate_tender"], "source_note": "Enter the use approved for this proposal."},
-    {"key": "tender_method", "label": "Tender method", "type": "text", "required_for": ["submit_lac", "generate_tender"], "source_note": "Enter only the tender method approved for this case."},
-    {"key": "lease_years", "label": "Lease period (years)", "type": "number", "step": "1", "required_for": ["calculate", "generate_tender"], "source_note": "Enter the lease period approved for this proposal."},
-    {"key": "fsi", "label": "Approved FSI", "type": "number", "step": "0.01", "required_for": ["calculate"], "source_note": "Enter the approved FSI; it is not inferred from the CSV."},
-    {"key": "approved_monthly_sor_rate", "label": "Approved monthly SoR / reserve rate (INR per sq. m)", "type": "number", "step": "0.01", "required_for": ["calculate"], "source_note": "Required from the approved SoR/LAC record for this proposal; it is not inferred from historic source rows."},
-    {"key": "annual_escalation_percent", "label": "Annual escalation (%)", "type": "number", "step": "0.01", "required_for": ["calculate"], "source_note": "Enter the escalation percentage approved for this proposal."},
-    {"key": "discount_rate_percent", "label": "Discount / G-Sec rate (%)", "type": "number", "step": "0.01", "required_for": ["calculate"], "source_note": "Enter the approved rate effective for the proposal date."},
-    {"key": "gst_percent", "label": "GST (%)", "type": "number", "step": "0.01", "required_for": ["calculate"], "source_note": "Enter the applicable approved GST rate."},
-    {"key": "service_charge_per_sqm_year", "label": "Service charge (INR per sq. m per year)", "type": "number", "step": "0.01", "required_for": [], "source_note": "Optional; enter only when applicable and approved."},
-    {"key": "nominal_rent_per_sqm_year", "label": "Nominal rent (INR per sq. m per year)", "type": "number", "step": "0.01", "required_for": [], "source_note": "Optional; enter only when applicable and approved."}
+    {"key": "tender_method", "label": "Tender method", "type": "select", "options": [{"value": "tender", "label": "Tender"}, {"value": "nominal", "label": "Nominal"}], "section": "commercial_setup", "required_for": ["submit_lac", "generate_tender"], "source_note": "Choose the approved commercial method for this proposal."},
+    {"key": "agreement_type", "label": "Agreement type", "type": "radio", "options": [{"value": "lease", "label": "Lease"}, {"value": "licence", "label": "Licence"}], "section": "commercial_setup", "required_for": ["submit_lac", "generate_tender"], "source_note": "Choose exactly one approved agreement type."},
+    {"key": "structure_applicable", "label": "Structure applicable", "type": "checkbox", "section": "commercial_setup", "source_note": "Select only when an approved/verified structure area must be used as the chargeable area."},
+    {"key": "structure_area_sqm", "label": "Verified structure area (sq. m)", "type": "number", "step": "0.01", "section": "commercial_setup", "visible_when": {"field": "structure_applicable", "equals": true}, "source_note": "Required when structure is selected; it replaces plot-area × FSI in the calculation."},
+    {"key": "calculation_basis", "label": "Consideration calculation", "type": "radio", "options": [{"value": "annual_rent", "label": "Annual rent"}, {"value": "upfront", "label": "Upfront premium"}], "section": "commercial_setup", "required_for": ["submit_lac", "generate_tender"], "source_note": "Choose whether this proposal is calculated as annual rent or discounted upfront premium."},
+    {"key": "calculation_source_scenario", "label": "Calculation workbook scenario", "type": "select", "options_source": "workbook_matches", "section": "commercial_setup", "source_note": "Shown only when an exact selected-plot match exists in the supplied workbook. Select a sheet to prefill its case-specific values."},
+    {"key": "g_sec_rate_date", "label": "G-Sec rate effective date", "type": "date", "section": "commercial_setup", "source_note": "Record the effective date of the approved G-Sec/discount rate. Required for upfront premium calculations."},
+    {"key": "discount_rate_percent", "label": "G-Sec / discount rate (%)", "type": "number", "step": "0.01", "section": "commercial_setup", "visible_when": {"field": "calculation_basis", "equals": "upfront"}, "source_note": "Enter the approved G-Sec/discount rate applicable on the recorded effective date."},
+    {"key": "service_charge_applicable", "label": "Service charge applicable", "type": "checkbox", "section": "commercial_setup", "source_note": "Select when an approved service charge applies. It is calculated and shown separately."},
+    {"key": "service_charge_per_sqm_month", "label": "Service charge (INR per sq. m per month)", "type": "number", "step": "0.01", "section": "commercial_setup", "visible_when": {"field": "service_charge_applicable", "equals": true}, "source_note": "Enter only the approved service-charge rate; it is not inferred from a different workbook case."},
+    {"key": "area_sqm", "label": "Plot area (sq. m)", "type": "number", "step": "0.01", "section": "financial_inputs", "source_field": "area", "required_for": ["calculate"], "source_note": "Prefilled from the selected vacant-plot record when available; verify by joint survey."},
+    {"key": "proposed_use", "label": "Proposed use", "type": "text", "section": "financial_inputs", "required_for": ["submit_lac", "generate_board_note", "generate_tender"], "source_note": "Enter the use approved for this proposal."},
+    {"key": "lease_years", "label": "Lease / licence period (years)", "type": "number", "step": "1", "section": "financial_inputs", "required_for": ["generate_tender"], "source_note": "Enter the approved period. It is required for an upfront premium calculation."},
+    {"key": "fsi", "label": "Approved FSI", "type": "number", "step": "0.01", "section": "financial_inputs", "visible_when": {"field": "structure_applicable", "equals": false}, "source_note": "Required when no verified structure area is used; it is not inferred from the CSV."},
+    {"key": "approved_monthly_sor_rate", "label": "Approved monthly SoR / reserve rate (INR per sq. m)", "type": "number", "step": "0.01", "section": "financial_inputs", "visible_when": {"field": "tender_method", "equals": "tender"}, "source_note": "Required for Tender method from an approved SoR/LAC record; it is not inferred from historic source rows."},
+    {"key": "nominal_rent_per_sqm_year", "label": "Approved nominal rent (INR per sq. m per year)", "type": "number", "step": "0.01", "section": "financial_inputs", "visible_when": {"field": "tender_method", "equals": "nominal"}, "source_note": "Required for Nominal method. Enter the approved case-specific rate; no nominal rate is assumed."},
+    {"key": "annual_escalation_percent", "label": "Annual escalation (%)", "type": "number", "step": "0.01", "section": "financial_inputs", "visible_when": {"field": "calculation_basis", "equals": "upfront"}, "source_note": "Enter the escalation percentage approved for this proposal."},
+    {"key": "gst_percent", "label": "GST (%)", "type": "number", "step": "0.01", "section": "financial_inputs", "visible_when": {"field": "calculation_basis", "equals": "upfront"}, "source_note": "Enter the applicable approved GST rate for the upfront premium."}
   ],
   "workflow": {
     "initial_status": "LAC_DRAFT",

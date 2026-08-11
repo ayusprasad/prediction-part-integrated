@@ -176,10 +176,23 @@ def build_tender_document_pdf(
 
     story.append(_heading("Entered proposal inputs", section_style))
     definitions = {field["key"]: field for field in config.get("form_fields", [])}
+
+    def display_input_value(key: str, value: Any) -> str:
+        definition = definitions.get(key, {})
+        if definition.get("type") == "checkbox":
+            return "Yes" if value is True or str(value).strip().casefold() in {"true", "1", "yes", "on"} else "No"
+        for option in definition.get("options", []):
+            if str(option.get("value")) == str(value):
+                return str(option.get("label", value))
+        return str(value)
+
     input_rows = []
     for key, value in (workflow.get("fields") or {}).items():
         if value not in (None, ""):
-            input_rows.append((definitions.get(key, {}).get("label", key.replace("_", " ").title()), value))
+            input_rows.append((
+                definitions.get(key, {}).get("label", key.replace("_", " ").title()),
+                display_input_value(key, value),
+            ))
     story.append(_key_value_table(input_rows, body_style, label_style) if input_rows else _paragraph("No proposal values have been entered.", body_style))
 
     if kind == "lac":
@@ -214,14 +227,29 @@ def build_tender_document_pdf(
     calculation = workflow.get("calculation") or {}
     story.append(_heading("Financial calculation draft", section_style))
     if calculation.get("ready"):
-        story.append(_key_value_table([
-            ("Developed area", f"{float(calculation['developed_area_sqm']):,.2f} sq. m"),
+        calculation_rows = [
+            ("Tender method", str(calculation.get("tender_method") or "Not available").replace("_", " ").title()),
+            ("Agreement type", str(calculation.get("agreement_type") or "Not available").title()),
+            ("Calculation basis", calculation.get("consideration_basis_label")),
+            ("Chargeable-area basis", calculation.get("area_basis")),
+            ("Chargeable area", f"{float(calculation['developed_area_sqm']):,.2f} sq. m"),
             ("Base monthly rent", _money(calculation.get("base_monthly_rent"))),
             ("Base annual rent", _money(calculation.get("base_annual_rent"))),
-            ("Upfront premium before GST", _money(calculation.get("upfront_premium_before_gst"))),
-            ("GST amount", _money(calculation.get("gst_amount"))),
-            ("Upfront premium including GST", _money(calculation.get("upfront_premium_including_gst"))),
-        ], body_style, label_style))
+        ]
+        if float(calculation.get("service_charge_annual") or 0) > 0:
+            calculation_rows.extend([
+                ("Annual service charge (separate)", _money(calculation.get("service_charge_annual"))),
+                ("Annual total including service charge", _money(calculation.get("annual_total_including_service_charge"))),
+            ])
+        if calculation.get("consideration_basis") == "upfront":
+            calculation_rows.extend([
+                ("Upfront premium before GST", _money(calculation.get("upfront_premium_before_gst"))),
+                ("GST amount", _money(calculation.get("gst_amount"))),
+                ("Upfront premium including GST", _money(calculation.get("upfront_premium_including_gst"))),
+            ])
+        else:
+            calculation_rows.append(("Selected annual consideration", _money(calculation.get("selected_consideration_amount"))))
+        story.append(_key_value_table(calculation_rows, body_style, label_style))
         schedule = calculation.get("schedule") or []
         if schedule:
             story.extend([Spacer(1, 4 * mm), _paragraph("Year-wise present-value schedule", label_style)])

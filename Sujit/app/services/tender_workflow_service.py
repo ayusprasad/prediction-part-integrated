@@ -42,6 +42,12 @@ class TenderWorkflowService:
         return str(value or "").strip().casefold()
 
     @staticmethod
+    def _clean_checkbox(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+    @staticmethod
     def _clean_number(value: Any, field_name: str, *, positive: bool = False) -> float:
         if value is None or str(value).strip() == "":
             raise TenderWorkflowError(f"{field_name} is required.")
@@ -185,7 +191,10 @@ class TenderWorkflowService:
             rows = self._workbook_rows(sheet)
             all_text = " ".join(value for row in rows.values() for value in row.values())
             years = re.search(r"FOR\s+(\d+)\s+YEARS", all_text, re.IGNORECASE)
+            escalation = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:annual(?:ly)?|p\.?a\.?)", all_text, re.IGNORECASE)
+            g_sec_reference = re.search(r"G\s*-?\s*Sec\s+rate(?:\s+of)?\s+([^|]+?)(?:\s{2,}|$)", all_text, re.IGNORECASE)
             scenario = {
+                "id": sheet["name"],
                 "sheet": sheet["name"],
                 "plot_name": self._workbook_value_after(rows, r"Plot No:", numeric=False),
                 "area_sqm": self._workbook_value_after(rows, r"PLOT AREA", numeric=True),
@@ -194,6 +203,8 @@ class TenderWorkflowService:
                 "ready_reckoner_zone": self._workbook_value_after(rows, r"ZONE AS PER READY RECKONER", numeric=False),
                 "sor_rate": self._workbook_value_after(rows, r"RATE (?:PER SQ\.\s*MTR\.\s*PER MONTH|AS PER SOR)", numeric=True),
                 "discount_rate_percent": self._workbook_value_after(rows, r"Discounting Factor", numeric=True),
+                "annual_escalation_percent": escalation.group(1) if escalation else "",
+                "g_sec_reference": re.sub(r"\s+", " ", g_sec_reference.group(1)).strip(" .") if g_sec_reference else "",
                 "source_file": self._source_path("calculation_workbook").name,
             }
             scenarios.append(scenario)
@@ -201,15 +212,34 @@ class TenderWorkflowService:
 
     def _workbook_matches(self, vacant_row: dict[str, str]) -> list[dict[str, Any]]:
         vacant_text = " ".join(str(v or "") for v in vacant_row.values()).casefold()
-        vacant_area = self._number(vacant_row.get("area"))
+        vacant_area = self._number(vacant_row.get("plot_area_sqm") or vacant_row.get("area"))
         matches = []
         for scenario in self.workbook_scenarios():
             scenario_text = str(scenario.get("plot_name", "")).casefold().strip()
             scenario_area = self._number(scenario.get("area_sqm"))
             name_match = bool(scenario_text and scenario_text in vacant_text)
             area_match = vacant_area is not None and scenario_area is not None and abs(vacant_area - scenario_area) < 0.01
-            if name_match or area_match:
-                matches.append({**scenario, "match_basis": "plot text" if name_match else "exact area"})
+            # An area alone is not a trustworthy commercial-case identifier:
+            # different plots can share an area. Workbook values are used only
+            # after the case plot text is also present in the selected source row.
+            # A workbook case may share a location/name with another record.  It is
+            # safe to apply commercial values only when both the plot identity text
+            # and the recorded area agree; a name alone is not an approved match.
+            if name_match and area_match:
+                prefill_fields = {
+                    "area_sqm": scenario.get("area_sqm", ""),
+                    "lease_years": scenario.get("lease_years", ""),
+                    "fsi": scenario.get("fsi", ""),
+                    "approved_monthly_sor_rate": scenario.get("sor_rate", ""),
+                    "annual_escalation_percent": scenario.get("annual_escalation_percent", ""),
+                    "discount_rate_percent": scenario.get("discount_rate_percent", ""),
+                    "calculation_source_scenario": scenario.get("id", ""),
+                }
+                matches.append({
+                    **scenario,
+                    "prefill_fields": {key: value for key, value in prefill_fields.items() if value not in (None, "")},
+                    "match_basis": "plot text and area",
+                })
         return matches
 
     def _load_records(self) -> list[dict[str, Any]]:
@@ -341,16 +371,12 @@ class TenderWorkflowService:
             raise TenderWorkflowError("Select a valid LAC checklist.")
         path = self._source_path(checklist["source_key"])
         header_values = self._checklist_header_values(path)
-        prefill_fields: dict[str, str] = {}
-        tender_method = header_values.get("proposed for govt. organization") or header_values.get("proposed for govt organization")
-        if tender_method:
-            prefill_fields["tender_method"] = tender_method
         return {
             "key": checklist_key,
             "label": checklist["label"],
             "source_file": path.name,
             "header_values": header_values,
-            "prefill_fields": prefill_fields,
+            "prefill_fields": {},
             "items": self._table_rows_from_markdown(path),
         }
 
@@ -375,14 +401,47 @@ class TenderWorkflowService:
             for target_field, source_field in source.get("prefill_fields", {}).items()
             if row.get(source_field, "") not in (None, "")
         }
+        workbook_matches = self._workbook_matches(row)
+        row_text = " ".join(str(value or "") for value in row.values()).casefold()
+        row_area = self._number(row.get("plot_area_sqm") or row.get("area"))
+        same_name_different_area = [
+            scenario
+            for scenario in self.workbook_scenarios()
+            if scenario.get("plot_name")
+            and str(scenario.get("plot_name", "")).casefold().strip() in row_text
+            and row_area is not None
+            and self._number(scenario.get("area_sqm")) is not None
+            and abs(row_area - self._number(scenario.get("area_sqm"))) >= 0.01
+        ]
+        if len(workbook_matches) == 1:
+            prefill_fields.update(workbook_matches[0].get("prefill_fields", {}))
+            workbook_prefill_status = (
+                f"Exact workbook match: {workbook_matches[0]['sheet']}. Its case-specific values were prefilled; "
+                "verify that this approved scenario applies before saving."
+            )
+        elif len(workbook_matches) > 1:
+            workbook_prefill_status = (
+                f"{len(workbook_matches)} exact workbook scenarios match this plot. Choose the applicable worksheet "
+                "in the commercial setup before using any workbook values."
+            )
+        elif same_name_different_area:
+            workbook_prefill_status = (
+                "A similarly named workbook case has a different recorded area, so its rates and terms were not "
+                "prefilled. Select a verified source case or enter approved values."
+            )
+        else:
+            workbook_prefill_status = (
+                "No exact calculation-workbook scenario matches this plot. Plot area is loaded from the selected vacant-plot "
+                "record; approved commercial inputs remain blank."
+            )
         return {
             "id": str(plot_id),
             "label": self._plot_label(row),
             "prefill_fields": prefill_fields,
             "source_snapshot": source_snapshot,
             "mapping": mapping,
-            "workbook_matches": [],
-            "workbook_prefill_status": "Case-example workbook values are not copied into a new tender workflow.",
+            "workbook_matches": workbook_matches,
+            "workbook_prefill_status": workbook_prefill_status,
             "rate_notice": "No approved current SoR/rate record is available in the public export. Enter or import an approved case-specific rate before calculating.",
         }
 
@@ -395,16 +454,163 @@ class TenderWorkflowService:
         for key, value in (fields or {}).items():
             if key not in definitions:
                 continue
-            if definitions[key].get("type") == "number":
+            field = definitions[key]
+            field_type = field.get("type")
+            if field_type == "number":
                 if value is None or str(value).strip() == "":
                     clean[key] = ""
                 else:
-                    clean[key] = self._clean_number(value, definitions[key]["label"])
+                    clean[key] = self._clean_number(value, field["label"])
+            elif field_type == "checkbox":
+                clean[key] = self._clean_checkbox(value)
+            elif field_type == "date":
+                text = str(value or "").strip()
+                if text:
+                    try:
+                        datetime.strptime(text, "%Y-%m-%d")
+                    except ValueError as error:
+                        raise TenderWorkflowError(f"{field['label']} must use YYYY-MM-DD format.") from error
+                clean[key] = text
             else:
-                clean[key] = str(value or "").strip()
+                text = str(value or "").strip()
+                options = field.get("options", [])
+                allowed_values = {
+                    str(option.get("value", "")).strip()
+                    if isinstance(option, dict) else str(option).strip()
+                    for option in options
+                }
+                if text and allowed_values and text not in allowed_values:
+                    raise TenderWorkflowError(f"{field['label']} has an invalid selection.")
+                clean[key] = text
         return clean
 
     def calculate(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """Calculate the selected tender consideration without manufacturing rates.
+
+        The workbook provides the demonstrated annual-rent/NPV method, but its
+        commercial values belong only to its matched worksheet. The selected
+        plot, approved user inputs, and configured formula rules drive this
+        calculation.
+        """
+        definitions = self._field_definitions()
+        fields = self._sanitize_fields(fields)
+        rules = self._config().get("calculation_rules", {})
+        method = fields.get("tender_method", "")
+        agreement_type = fields.get("agreement_type", "")
+        basis = fields.get("calculation_basis", "")
+        structure_applicable = bool(fields.get("structure_applicable", False))
+
+        required_keys = ["tender_method", "agreement_type", "calculation_basis", "area_sqm"]
+        required_keys.append("structure_area_sqm" if structure_applicable else "fsi")
+        if method == "tender":
+            required_keys.append("approved_monthly_sor_rate")
+        elif method == "nominal":
+            required_keys.append("nominal_rent_per_sqm_year")
+        if fields.get("service_charge_applicable"):
+            required_keys.append("service_charge_per_sqm_month")
+        if basis == "upfront":
+            required_keys.extend(["lease_years", "annual_escalation_percent", "g_sec_rate_date", "discount_rate_percent", "gst_percent"])
+        missing = [definitions[key]["label"] for key in required_keys if fields.get(key) in (None, "")]
+        if missing:
+            return {"ready": False, "missing_fields": missing, "steps": []}
+
+        area = self._clean_number(fields["area_sqm"], definitions["area_sqm"]["label"], positive=True)
+        if structure_applicable:
+            chargeable_area = self._clean_number(fields["structure_area_sqm"], definitions["structure_area_sqm"]["label"], positive=True)
+            area_basis_label = "Verified structure area"
+            fsi = None
+        else:
+            fsi = self._clean_number(fields["fsi"], definitions["fsi"]["label"], positive=True)
+            chargeable_area = area * fsi
+            area_basis_label = "Plot area × approved FSI"
+
+        months_per_year = self._clean_number(rules.get("months_per_year"), "Configured months per year", positive=True)
+        if method == "tender":
+            monthly_rate = self._clean_number(fields["approved_monthly_sor_rate"], definitions["approved_monthly_sor_rate"]["label"], positive=True)
+            base_monthly_rent = chargeable_area * monthly_rate
+            base_annual_rent = base_monthly_rent * months_per_year
+            rate_basis = "Approved monthly SoR / reserve rate"
+        elif method == "nominal":
+            nominal_rate = self._clean_number(fields["nominal_rent_per_sqm_year"], definitions["nominal_rent_per_sqm_year"]["label"], positive=True)
+            base_annual_rent = chargeable_area * nominal_rate
+            base_monthly_rent = base_annual_rent / months_per_year
+            rate_basis = "Approved nominal annual rent rate"
+        else:
+            return {"ready": False, "missing_fields": [definitions["tender_method"]["label"]], "steps": []}
+
+        service_charge_annual = 0.0
+        if fields.get("service_charge_applicable"):
+            service_rate = self._clean_number(fields.get("service_charge_per_sqm_month"), definitions["service_charge_per_sqm_month"]["label"], positive=True)
+            service_charge_annual = chargeable_area * service_rate * months_per_year
+
+        calculation: dict[str, Any] = {
+            "ready": True,
+            "currency": "INR",
+            "tender_method": method,
+            "agreement_type": agreement_type,
+            "consideration_basis": basis,
+            "consideration_basis_label": "Annual rent" if basis == "annual_rent" else "Upfront premium",
+            "area_basis": area_basis_label,
+            "plot_area_sqm": area,
+            "approved_fsi": fsi,
+            "developed_area_sqm": chargeable_area,
+            "base_monthly_rent": base_monthly_rent,
+            "base_annual_rent": base_annual_rent,
+            "service_charge_annual": service_charge_annual,
+            "annual_total_including_service_charge": base_annual_rent + service_charge_annual,
+            "upfront_premium_before_gst": None,
+            "gst_amount": None,
+            "upfront_premium_including_gst": None,
+            "schedule": [],
+            "steps": [
+                f"Chargeable area = {area_basis_label.lower()}.",
+                f"Annual rent is calculated from the {rate_basis.lower()}.",
+            ],
+            "source_references": [
+                self._config()["source_files"]["upfront_calculation_reference"],
+                self._config()["source_files"]["npv_calculation_reference"],
+            ],
+        }
+        if service_charge_annual:
+            calculation["steps"].append("Approved service charge is calculated separately and is not added to the upfront NPV without an approved source formula.")
+
+        if basis == "annual_rent":
+            calculation["selected_consideration_amount"] = base_annual_rent
+            calculation["steps"].append("Selected consideration is the annual rent; G-Sec discounting and GST are not applied to this annual-rent result.")
+            return calculation
+        if basis != "upfront":
+            return {"ready": False, "missing_fields": [definitions["calculation_basis"]["label"]], "steps": []}
+
+        lease_years = self._clean_number(fields["lease_years"], definitions["lease_years"]["label"], positive=True)
+        if not lease_years.is_integer():
+            raise TenderWorkflowError("Lease / licence period must be a whole number of years.")
+        escalation = self._clean_number(fields["annual_escalation_percent"], definitions["annual_escalation_percent"]["label"])
+        discount = self._clean_number(fields["discount_rate_percent"], definitions["discount_rate_percent"]["label"])
+        gst = self._clean_number(fields["gst_percent"], definitions["gst_percent"]["label"])
+        npv_total = 0.0
+        schedule: list[dict[str, float | int]] = []
+        for year in range(1, int(lease_years) + 1):
+            annual_rent = base_annual_rent * ((1 + escalation / 100) ** (year - 1))
+            discount_factor = 1 / ((1 + discount / 100) ** (year - 1))
+            present_value = annual_rent * discount_factor
+            npv_total += present_value
+            schedule.append({"year": year, "annual_rent": annual_rent, "discount_factor": discount_factor, "present_value": present_value})
+        gst_amount = npv_total * gst / 100
+        calculation.update({
+            "upfront_premium_before_gst": npv_total,
+            "gst_amount": gst_amount,
+            "upfront_premium_including_gst": npv_total + gst_amount,
+            "selected_consideration_amount": npv_total + gst_amount,
+            "schedule": schedule,
+        })
+        calculation["steps"].extend([
+            "Each lease-year rent is escalated by the entered approved annual escalation percentage.",
+            "Each year is discounted using the approved G-Sec/discount rate; the upfront premium is the sum of those present values.",
+            "GST is calculated from the resulting upfront premium using the entered approved percentage.",
+        ])
+        return calculation
+
+    def _legacy_calculate_v2(self, fields: dict[str, Any]) -> dict[str, Any]:
         definitions = self._field_definitions()
         required_keys = ("area_sqm", "lease_years", "fsi", "approved_monthly_sor_rate", "annual_escalation_percent", "discount_rate_percent", "gst_percent")
         missing = [definitions[key]["label"] for key in required_keys if fields.get(key) in (None, "")]

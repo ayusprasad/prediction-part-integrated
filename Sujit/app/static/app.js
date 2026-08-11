@@ -15,6 +15,7 @@ let tenderConfig = null;
 let tenderWorkflow = null;
 let tenderSelectedPlot = null;
 let tenderCalculationTimer = null;
+let tenderFieldState = {};
 
 // Updated suggestion chips
 const suggestionItems = [
@@ -1085,7 +1086,7 @@ function tenderFieldValue(key) {
   return document.querySelector(`[data-tender-field="${key}"]`)?.value?.trim() || "";
 }
 
-function readTenderFields() {
+function legacyReadTenderFields() {
   const fields = {};
   document.querySelectorAll("[data-tender-field]").forEach((input) => { fields[input.dataset.tenderField] = input.value.trim(); });
   return fields;
@@ -1097,7 +1098,7 @@ function readTenderChecklist() {
   return answers;
 }
 
-function renderTenderFields(values = {}) {
+function legacyRenderTenderFields(values = {}) {
   const container = document.getElementById("tender-fields-container");
   if (!container || !tenderConfig) return;
   container.replaceChildren();
@@ -1147,6 +1148,151 @@ function renderTenderFields(values = {}) {
   });
 }
 
+function tenderCheckboxValue(value) {
+  return value === true || String(value ?? "").trim().toLowerCase() === "true" || String(value ?? "").trim() === "1";
+}
+
+function tenderFieldVisible(field, values) {
+  if (field.options_source === "workbook_matches" && !(tenderSelectedPlot?.workbook_matches || []).length) return false;
+  const condition = field.visible_when;
+  if (!condition) return true;
+  const current = values[condition.field];
+  if (typeof condition.equals === "boolean") return tenderCheckboxValue(current) === condition.equals;
+  return String(current ?? "") === String(condition.equals ?? "");
+}
+
+function tenderFieldOptions(field) {
+  if (field.options_source === "workbook_matches") {
+    return (tenderSelectedPlot?.workbook_matches || []).map((scenario) => ({
+      value: scenario.id,
+      label: `${scenario.sheet} — ${scenario.match_basis}`,
+    }));
+  }
+  return (field.options || []).map((option) => (
+    typeof option === "object" ? option : { value: option, label: option }
+  ));
+}
+
+function readTenderFields() {
+  const fields = { ...tenderFieldState };
+  document.querySelectorAll("[data-tender-field]").forEach((input) => {
+    const key = input.dataset.tenderField;
+    if (input.type === "checkbox") fields[key] = input.checked;
+    else if (input.type !== "radio" || input.checked) fields[key] = input.value.trim();
+  });
+  return fields;
+}
+
+function addTenderSourceNote(wrapper, field) {
+  if (!field.source_note) return;
+  const note = document.createElement("span");
+  note.className = "mt-1 block text-[10px] text-muted-foreground";
+  note.textContent = field.source_note;
+  wrapper.appendChild(note);
+}
+
+function updateTenderFieldState(field, value) {
+  const values = readTenderFields();
+  values[field.key] = value;
+  if (field.key === "calculation_source_scenario") {
+    const scenario = (tenderSelectedPlot?.workbook_matches || []).find((item) => item.id === value);
+    if (scenario?.prefill_fields) Object.assign(values, scenario.prefill_fields);
+  }
+  const hasDependentFields = tenderConfig.form_fields.some((candidate) => candidate.visible_when?.field === field.key);
+  if (hasDependentFields || field.key === "calculation_source_scenario") renderTenderFields(values, false);
+  else tenderFieldState = { ...tenderFieldState, ...values };
+  scheduleTenderCalculation();
+}
+
+function renderTenderFields(values = {}, reset = true) {
+  const commercial = document.getElementById("tender-commercial-setup-container");
+  const financial = document.getElementById("tender-financial-fields-container");
+  if (!commercial || !financial || !tenderConfig) return;
+  tenderFieldState = reset ? { ...values } : { ...tenderFieldState, ...values };
+  commercial.replaceChildren();
+  financial.replaceChildren();
+
+  tenderConfig.form_fields.forEach((field) => {
+    if (!tenderFieldVisible(field, tenderFieldState)) return;
+    const container = field.section === "commercial_setup" ? commercial : financial;
+    const sourceValue = tenderFieldState[field.key] ?? "";
+    const baseClass = "mt-1 h-10 w-full rounded-lg border border-border px-3 text-sm text-foreground";
+    let wrapper;
+
+    if (field.type === "radio") {
+      wrapper = document.createElement("fieldset");
+      wrapper.className = "text-xs text-muted-foreground";
+      const legend = document.createElement("legend");
+      legend.textContent = field.label;
+      wrapper.appendChild(legend);
+      const choices = document.createElement("div");
+      choices.className = "mt-2 flex flex-wrap gap-3";
+      tenderFieldOptions(field).forEach((option) => {
+        const choice = document.createElement("label");
+        choice.className = "inline-flex items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm text-foreground";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = `tender-${field.key}`;
+        input.value = option.value;
+        input.dataset.tenderField = field.key;
+        input.checked = String(sourceValue) === String(option.value);
+        input.onchange = () => updateTenderFieldState(field, option.value);
+        choice.append(input, document.createTextNode(option.label));
+        choices.appendChild(choice);
+      });
+      wrapper.appendChild(choices);
+      addTenderSourceNote(wrapper, field);
+    } else if (field.type === "checkbox") {
+      wrapper = document.createElement("label");
+      wrapper.className = "flex flex-col justify-end text-xs text-muted-foreground";
+      const choice = document.createElement("span");
+      choice.className = "mt-5 inline-flex items-center gap-2 rounded-lg border border-border bg-white px-3 py-2 text-sm text-foreground";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.dataset.tenderField = field.key;
+      input.checked = tenderCheckboxValue(sourceValue);
+      input.onchange = () => updateTenderFieldState(field, input.checked);
+      choice.append(input, document.createTextNode(field.label));
+      wrapper.append(choice);
+      addTenderSourceNote(wrapper, field);
+    } else {
+      wrapper = document.createElement("label");
+      wrapper.className = "text-xs text-muted-foreground";
+      wrapper.append(document.createTextNode(field.label));
+      const input = document.createElement(field.type === "select" ? "select" : "input");
+      input.dataset.tenderField = field.key;
+      input.className = baseClass;
+      if (field.type === "select") {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "Select";
+        input.appendChild(empty);
+        tenderFieldOptions(field).forEach((option) => {
+          const element = document.createElement("option");
+          element.value = option.value;
+          element.textContent = option.label;
+          input.appendChild(element);
+        });
+      } else if (field.type === "number") {
+        input.type = "number";
+        input.min = "0";
+        input.step = field.step || "any";
+      } else if (field.type === "date") {
+        input.type = "date";
+      } else {
+        input.type = "text";
+      }
+      input.value = sourceValue;
+      input.oninput = () => scheduleTenderCalculation();
+      input.onchange = () => updateTenderFieldState(field, input.value.trim());
+      if (field.source_note) input.title = field.source_note;
+      wrapper.appendChild(input);
+      addTenderSourceNote(wrapper, field);
+    }
+    container.appendChild(wrapper);
+  });
+}
+
 function scheduleTenderCalculation() {
   if (tenderCalculationTimer) clearTimeout(tenderCalculationTimer);
   tenderCalculationTimer = setTimeout(previewTenderCalculation, 250);
@@ -1191,7 +1337,7 @@ function formatTenderMoney(value) {
   return Number.isFinite(amount) ? `INR ${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "Not available";
 }
 
-function renderTenderCalculation(calculation) {
+function legacyRenderTenderCalculation(calculation) {
   const container = document.getElementById("tender-calculation");
   if (!container) return;
   container.replaceChildren();
@@ -1217,6 +1363,56 @@ function renderTenderCalculation(calculation) {
     row.append(term, description); list.appendChild(row);
   });
   container.appendChild(list);
+}
+
+function renderTenderCalculation(calculation) {
+  const container = document.getElementById("tender-calculation");
+  if (!container) return;
+  container.replaceChildren();
+  if (!calculation || !calculation.ready) {
+    const message = document.createElement("p");
+    message.textContent = calculation?.missing_fields?.length
+      ? `Calculation pending: ${calculation.missing_fields.join(", ")}.`
+      : "Choose a plot and enter approved calculation inputs to prepare the calculation.";
+    container.appendChild(message);
+    return;
+  }
+  const values = [
+    ["Tender method", String(calculation.tender_method || "").replace(/\b\w/g, (letter) => letter.toUpperCase())],
+    ["Agreement type", String(calculation.agreement_type || "").replace(/\b\w/g, (letter) => letter.toUpperCase())],
+    ["Calculation basis", calculation.consideration_basis_label || "Not available"],
+    ["Chargeable area", `${Number(calculation.developed_area_sqm).toLocaleString("en-IN", { maximumFractionDigits: 2 })} sq. m`],
+    ["Annual rent", formatTenderMoney(calculation.base_annual_rent)],
+  ];
+  if (Number(calculation.service_charge_annual) > 0) {
+    values.push(["Annual service charge (separate)", formatTenderMoney(calculation.service_charge_annual)]);
+    values.push(["Annual total including service charge", formatTenderMoney(calculation.annual_total_including_service_charge)]);
+  }
+  if (calculation.consideration_basis === "upfront") {
+    values.push(["Upfront premium before GST", formatTenderMoney(calculation.upfront_premium_before_gst)]);
+    values.push(["GST", formatTenderMoney(calculation.gst_amount)]);
+    values.push(["Upfront premium including GST", formatTenderMoney(calculation.upfront_premium_including_gst)]);
+  } else {
+    values.push(["Selected annual consideration", formatTenderMoney(calculation.selected_consideration_amount)]);
+  }
+  const list = document.createElement("dl");
+  list.className = "grid gap-2 sm:grid-cols-2";
+  values.forEach(([name, value]) => {
+    const row = document.createElement("div");
+    const term = document.createElement("dt");
+    term.className = "text-xs text-muted-foreground";
+    term.textContent = name;
+    const description = document.createElement("dd");
+    description.className = "font-medium text-navy";
+    description.textContent = value;
+    row.append(term, description);
+    list.appendChild(row);
+  });
+  container.appendChild(list);
+  const source = document.createElement("p");
+  source.className = "mt-3 text-xs text-muted-foreground";
+  source.textContent = calculation.area_basis || "";
+  container.appendChild(source);
 }
 
 function formatTenderSourceLabel(key) {

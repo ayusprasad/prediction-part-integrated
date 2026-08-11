@@ -256,9 +256,15 @@
           <div id="tender-plot-summary" class="hidden mt-3 rounded-lg border border-border bg-secondary/40 p-3 text-xs text-muted-foreground"></div>
 
           <section class="mt-5 rounded-xl border border-border p-4">
+            <h4 class="font-display text-base font-semibold text-navy">Commercial setup</h4>
+            <p class="mt-1 text-xs text-muted-foreground">Choose the tender and agreement terms first. Conditional inputs appear only when they apply.</p>
+            <div id="tender-commercial-setup-container" class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"></div>
+          </section>
+
+          <section class="mt-4 rounded-xl border border-border p-4">
             <h4 class="font-display text-base font-semibold text-navy">Proposal and approved financial inputs</h4>
-            <p class="mt-1 text-xs text-muted-foreground">Blank values remain blank until an authorised source provides them.</p>
-            <div id="tender-fields-container" class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"></div>
+            <p class="mt-1 text-xs text-muted-foreground">The selected vacant plot supplies its available source context. Approved case inputs remain blank unless an exact workbook scenario matches.</p>
+            <div id="tender-financial-fields-container" class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"></div>
           </section>
 
           <section id="tender-source-context-section" class="hidden mt-4 rounded-xl border border-border bg-secondary/30 p-4">
