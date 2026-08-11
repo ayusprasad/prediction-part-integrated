@@ -174,7 +174,6 @@ def build_tender_document_pdf(
     ]
     story.append(_key_value_table(snapshot_rows, body_style, label_style) if snapshot_rows else _paragraph("No source plot context was available when this workflow was created.", body_style))
 
-    story.append(_heading("Entered proposal inputs", section_style))
     definitions = {field["key"]: field for field in config.get("form_fields", [])}
 
     def display_input_value(key: str, value: Any) -> str:
@@ -186,14 +185,33 @@ def build_tender_document_pdf(
                 return str(option.get("label", value))
         return str(value)
 
-    input_rows = []
-    for key, value in (workflow.get("fields") or {}).items():
-        if value not in (None, ""):
-            input_rows.append((
-                definitions.get(key, {}).get("label", key.replace("_", " ").title()),
-                display_input_value(key, value),
-            ))
-    story.append(_key_value_table(input_rows, body_style, label_style) if input_rows else _paragraph("No proposal values have been entered.", body_style))
+    saved_fields = workflow.get("fields") or {}
+
+    def input_rows_for(section: str) -> list[tuple[str, str]]:
+        rows = []
+        for definition in config.get("form_fields", []):
+            if definition.get("section") != section:
+                continue
+            key = definition["key"]
+            value = saved_fields.get(key)
+            if value not in (None, ""):
+                rows.append((definition.get("label", key.replace("_", " ").title()), display_input_value(key, value)))
+        return rows
+
+    commercial_rows = input_rows_for("commercial_setup")
+    proposal_rows = input_rows_for("financial_inputs")
+    story.append(_heading("Commercial setup", section_style))
+    story.append(
+        _key_value_table(commercial_rows, body_style, label_style)
+        if commercial_rows
+        else _paragraph("No commercial terms have been recorded.", body_style)
+    )
+    story.append(_heading("Proposal and approved financial inputs", section_style))
+    story.append(
+        _key_value_table(proposal_rows, body_style, label_style)
+        if proposal_rows
+        else _paragraph("No proposal or approved financial inputs have been entered.", body_style)
+    )
 
     if kind == "lac":
         story.append(_heading("LAC checklist responses", section_style))
