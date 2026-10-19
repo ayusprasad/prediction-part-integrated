@@ -1,18 +1,18 @@
-# Secrets and local configuration
+# Environment secrets
 .env
 .env.*
 **/.env
 **/.env.*
 !**/.env.example
 
-# Python environments and caches
+# Python
 .venv/
 **/.venv/
 __pycache__/
 **/__pycache__/
 *.py[cod]
 
-# JavaScript dependencies and generated output
+# JavaScript
 node_modules/
 **/node_modules/
 .next/
@@ -24,12 +24,18 @@ dist/
 .wrangler/
 **/.wrangler/
 
-# Local app data, uploads, logs, and generated artifacts
+# Local runtime state, exports, logs, and temporary previews
 Sujit/data/
-**/*.sqlite3
+Sujit/tmp/
+Sujit/outputs/
+Sujit/logs/
 *.log
 **/*.log
 *.tmp
+*.sqlite3
 
-# Preserved nested repository metadata
-**/.git-frontend-backup/
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
